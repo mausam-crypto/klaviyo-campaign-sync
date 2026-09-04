@@ -1,9 +1,11 @@
 # klaviyo-campaign-sync
 
-Automates what happens after Cellexia's EN Klaviyo campaign's native A/B test concludes:
-computes an independent winner (Click Rate primary, Placed Order Rate override), then applies
-that winner's content to the 14 language-campaign drafts and schedules them for 10 AM recipient
-local time.
+Automates what happens after Cellexia's EN Klaviyo campaign's native A/B test concludes: computes
+an independent winner (Placed Order Rate is the primary metric, Click Rate only breaks an exact
+tie), validates the 14 language-campaign drafts, and tells a human exactly which message to
+delete and which campaign to send — no Klaviyo API can finish that last step itself (see
+docs/DESIGN.md §7), so the automation stops at a Slack handoff and later verifies it was done
+correctly.
 
 **Read [docs/DESIGN.md](docs/DESIGN.md) first.** It documents the business logic, the Klaviyo API
 behavior this depends on (some of it verified against real account data, not just docs — see
@@ -14,9 +16,11 @@ detectable) and how this project works around it.
 ## Status
 
 Phases 1–3 of the rollout plan (docs/ARCHITECTURE.md) are built and validated against live,
-real Klaviyo data (read-only). Phase 4+ (Postgres-backed idempotency, the write path, Slack
-notifications) is implemented but **not yet live-tested** — no Postgres or Slack webhook is
-provisioned yet.
+real Klaviyo data (read-only). Phase 4+ (Postgres-backed idempotency, the Slack handoff, and its
+completion-verification pass) is implemented but **not yet live-tested** — Postgres isn't
+provisioned yet. Slack webhook is configured. The automation makes zero write calls to Klaviyo by
+design (see docs/DESIGN.md §7) — its only real-world effects are a Slack message and its own
+database records.
 
 ## Setup
 

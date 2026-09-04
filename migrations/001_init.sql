@@ -31,11 +31,12 @@ create table language_campaign_results (
   execution_id          uuid not null references campaign_group_executions(id),
   language_code         text not null,
   campaign_id           text,
-  variation_message_id  text,
+  keep_message_id       text, -- the winning variation's message id -- what a human should keep
+  delete_message_id     text, -- the losing variation's message id -- what a human should delete
   validation_status     text not null,
   validation_failures   jsonb,
-  scheduled_send_at     timestamptz,
-  action                text not null,
+  action                text not null, -- AWAITING_MANUAL_ACTION | CONFIRMED_SENT | MISMATCH_DETECTED
+  confirmed_at          timestamptz,
   created_at            timestamptz not null default now(),
   unique (execution_id, language_code)
 );

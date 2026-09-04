@@ -58,11 +58,12 @@ create table language_campaign_results (
   execution_id      uuid not null references campaign_group_executions(id),
   language_code     text not null,
   campaign_id       text,
-  variation_message_id text,
+  keep_message_id   text,      -- winning variation's message id -- what a human should keep
+  delete_message_id text,      -- losing variation's message id -- what a human should delete
   validation_status text not null,             -- PASSED | FAILED
   validation_failures jsonb,                    -- list of which of the 14 checks failed, if any
-  scheduled_send_at timestamptz,
-  action            text not null,              -- WOULD_SCHEDULE (dry-run) | SCHEDULED | SKIPPED
+  action            text not null,              -- AWAITING_MANUAL_ACTION | CONFIRMED_SENT | MISMATCH_DETECTED
+  confirmed_at      timestamptz,
   created_at        timestamptz not null default now(),
   unique (execution_id, language_code)
 );
@@ -76,41 +77,53 @@ create table campaign_exclusions (
 
 ## Idempotency
 
+**Revised 2026-09-03**: the automation makes zero write calls to Klaviyo (DESIGN.md §7 — no
+supported API can finish the delete+send step, so it stops at a Slack handoff to a human). That
+removes an entire category of risk this section originally had to guard against ("did our send
+call actually land, or did it fail after partially succeeding?" no longer applies) — but the
+handoff and its confirmation still need to be idempotent, since a human acting on a duplicate
+Slack alert, or the automation double-confirming, is still a real failure mode.
+
 - `campaign_group_executions.campaign_group_tag` is unique — before doing anything, the run
-  queries for an existing row for this family. If one exists with `status = SUCCESS`, the family is
-  skipped entirely (logged as `already processed`, not an error). If one exists mid-flight
-  (`VALIDATING`/`SCHEDULING`) from a prior run that crashed, the run resumes from that row's state
-  rather than recomputing the winner from scratch — the winner, once written, is never
-  recalculated for the same family.
-- Per-language scheduling is itself idempotent: before calling the schedule API for a language
-  campaign, check `language_campaign_results` for an existing `SCHEDULED` row for that
-  `(execution_id, language_code)` pair, and separately re-check the live campaign's own `status`
-  isn't already `Scheduled`/`Sending`/`Sent` (defense in depth — catches a manual scheduling done
-  outside the automation too).
+  queries for an existing row for this family. `status = SUCCESS` → skip entirely (already fully
+  confirmed done). `status = AWAITING_MANUAL_ACTION` → skip winner computation and go straight to
+  `verifyManualCompletion()` (below) — the winner, once computed and notified, is never
+  recomputed or re-notified for the same family. `status = FAILED` → does not auto-retry; a human
+  needs to look at `failure_reason`.
+- `language_campaign_results` is keyed `unique (execution_id, language_code)` — the
+  keep/delete-message-id decision for a language is written once (`AWAITING_MANUAL_ACTION`) and
+  from then on only transitions forward to `CONFIRMED_SENT` or `MISMATCH_DETECTED`, never
+  recomputed.
+- **Closing the loop**: every run for a family still in `AWAITING_MANUAL_ACTION` re-fetches its
+  language campaigns and checks each one still pending confirmation: if it now has exactly one
+  message and that message's id matches the recorded `keep_message_id`, mark it
+  `CONFIRMED_SENT`. If it has one message that *doesn't* match, that's a real anomaly (wrong
+  variation sent) — `MISMATCH_DETECTED`, alerted once via `notifyMismatch()`, never silently
+  re-alerted every 5 minutes. Once every language in a family is `CONFIRMED_SENT`, the family
+  flips to `SUCCESS` and `notifyCompletion()` fires.
 
 ## Retry / rate-limit handling
 
 - Every Klaviyo call goes through one retry wrapper: on `429`, respect `Retry-After` if present,
   else exponential backoff (1s, 2s, 4s, 8s), capped at 4 attempts. On `5xx`, same backoff, capped
   at 3 attempts. On `4xx` other than 429, no retry — that's a real error (bad request, auth,
-  validation) and retrying won't help.
-- **Writes that cause a real-world effect (schedule, send) are never blindly retried.** Before
-  retrying a schedule/send call after a timeout or ambiguous error, the wrapper re-fetches the
-  campaign's current `status` first — if it already shows `Scheduled`/`Sending`/`Sent`, the
-  original call actually succeeded server-side despite the client-side error, and the retry is
-  skipped (logged as `write succeeded despite transport error, not retrying`).
-- The Reporting API's tight rate limit (1/s, 2/m, 225/day) means: never poll it more often than the
-  30-minute cron interval already provides headroom for, and never call it in a loop across many
-  campaigns per run — one call per pending EN family per run, grouped by `campaign_message_id`, is
-  enough to get both variations' stats in a single request.
+  validation) and retrying won't help. Since every Klaviyo call this project makes is a read
+  (`GET`/`POST` against the Reporting API, which is also read-only despite the verb), a blind
+  retry here is safe by construction — there's no write to accidentally double-apply.
+- The Reporting API's tight rate limit (1/s, 2/m, 225/day) means: never poll it more often than
+  the 5-minute cron interval already provides headroom for, and never call it in a loop across
+  many campaigns per run — one call per pending EN family per run, grouped by
+  `campaign_id, campaign_message_id, variation` (all three required together — verified against
+  the live API), is enough to get both variations' stats in a single request.
 
 ## Dry-run mode
 
-`DRY_RUN=true` env var. When set, the write-choke-point in the Klaviyo client wrapper logs the
-exact request it *would* have made (method, endpoint, body) and returns a synthetic success
-without calling Klaviyo. All read calls (campaigns, reporting, metrics, tags) still execute for
-real, so winner computation and validation run against real data. Output matches the format in
-§23 of your spec. This is the default for every phase below except 7–8.
+`DRY_RUN=true` env var. Since there's no Klaviyo write path to intercept anymore, this instead
+gates the two side effects that do exist: Slack notifications (logged to console instead of
+posted) and the DB writes that would mark a family `AWAITING_MANUAL_ACTION`/`SUCCESS`/`FAILED`
+for real. Winner computation, validation, and all read calls still execute for real either way,
+so dry-run output reflects genuine analysis of real data — it just doesn't alert anyone or
+persist state that a later real run would need to respect.
 
 ## Kill switches
 
@@ -162,6 +175,7 @@ automation self-promotes through.
 - `KLAVIYO_API_KEY` and `SLACK_WEBHOOK_URL` live only in Render's env var store. Never logged —
   the retry/error-logging wrapper explicitly redacts the `Authorization` header and webhook URL
   from any logged request/error object.
-- Minimum scopes requested at each phase (see API_CAPABILITY_MATRIX.md) — `campaigns:write` isn't
-  requested on the key until Phase 6.
+- Minimum scopes only: `campaigns:read`, `metrics:read`, `tags:read`. `campaigns:write` is never
+  requested — the automation makes no write calls to Klaviyo at all (DESIGN.md §7), so there's no
+  phase where it becomes needed.
 - `.env` stays gitignored; `.env.example` ships with empty placeholders only.

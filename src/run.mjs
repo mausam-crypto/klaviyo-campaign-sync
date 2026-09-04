@@ -1,33 +1,27 @@
 // Main cron entry point (`npm run run`, invoked every 5 minutes by the Render Cron Job).
 //
 // NOT YET LIVE-TESTED end-to-end — depends on a provisioned Postgres (DATABASE_URL) which does
-// not exist yet as of this writing. Phase 4 in ARCHITECTURE.md's testing plan is "dry-run full
-// execution"; this file is that implementation, but running it for the first time against a real
-// DB is still pending. AUTOMATION_ENABLED defaults to false specifically so this can be deployed
-// and iterated on safely before that first real run.
+// not exist yet as of this writing. AUTOMATION_ENABLED defaults to false specifically so this can
+// be deployed and iterated on safely before that first real run.
+//
+// Write path (2026-09-03, confirmed with you): the automation does NOT delete a message, archive
+// a campaign, or send anything. No Klaviyo API can remove one message from a two-message campaign
+// or send only one of its messages (verified against the raw stable OpenAPI spec — see
+// DESIGN.md §7). So this stops at computing and validating the winner, then hands off to a human
+// via Slack with the exact message to delete and campaign to send, per language. A later run
+// verifies the human's action landed correctly before marking the family SUCCESS.
 import { config } from "./config.mjs";
-import { klaviyoGet, klaviyoPatch, klaviyoPost } from "./klaviyoClient.mjs";
+import { klaviyoGet } from "./klaviyoClient.mjs";
 import { lookupPlacedOrderMetricId } from "./metrics.mjs";
 import { fetchVariationStats } from "./reporting.mjs";
 import { classifySnapshot, decideWinner } from "./winner.mjs";
 import { groupCampaignsByFamily, checkFamilyCompleteness } from "./family.mjs";
-import { validateDualCampaignLanguage } from "./validate.mjs";
-import { findExecution, createOrGetExecution, updateExecution, isCampaignExcluded, recordHeartbeat } from "./db.mjs";
-import { notifySuccess, notifyFailure } from "./slack.mjs";
-
-/**
- * UNVERIFIED, needs Phase 5 (controlled test campaign) confirmation before this ever runs for
- * real: what calendar date to target for the "10 AM recipient local time" send. Heuristic below —
- * same UTC calendar day if there's still enough runway before 10 AM could plausibly have passed
- * in every timezone, otherwise the next day. Not something to trust without a real dry run.
- */
-function computeTargetSendDate() {
-  const now = new Date();
-  const cutoffUtcHour = 8; // last hour we'll still target "today" — leaves margin before 10am local anywhere
-  const target = new Date(now);
-  if (now.getUTCHours() >= cutoffUtcHour) target.setUTCDate(target.getUTCDate() + 1);
-  return target.toISOString().slice(0, 10); // "YYYY-MM-DD"
-}
+import { validateLanguageCampaign, identifyVariationMessages } from "./validate.mjs";
+import {
+  findExecution, createOrGetExecution, updateExecution, isCampaignExcluded, recordHeartbeat,
+  upsertLanguageResult, getLanguageResults, confirmLanguageResult,
+} from "./db.mjs";
+import { notifyWinnerReady, notifyCompletion, notifyMismatch, notifyFailure } from "./slack.mjs";
 
 async function listRecentEmailCampaigns() {
   const res = await klaviyoGet(
@@ -67,6 +61,45 @@ function isEnTestReadyToPoll(enCampaign) {
   );
 }
 
+/** Re-checks each language's campaign against what a human was asked to do. Never auto-corrects
+ *  anything — only confirms a match or raises a mismatch alert, once per language. */
+async function verifyManualCompletion(execution, family, campaignGroupTag) {
+  const priorResults = await getLanguageResults(execution.id);
+  let allConfirmed = true;
+
+  for (const prior of priorResults) {
+    if (prior.action === "CONFIRMED_SENT") continue; // already closed out
+
+    const campaign = family.languages.get(prior.language_code);
+    const messages = campaign?._messages || [];
+
+    if (messages.length >= 2) {
+      allConfirmed = false; // not actioned yet — normal, not an error
+      continue;
+    }
+    if (messages.length === 0) {
+      allConfirmed = false;
+      continue;
+    }
+
+    const remaining = messages[0];
+    if (remaining.id === prior.keep_message_id) {
+      await confirmLanguageResult(prior.id, "CONFIRMED_SENT");
+    } else {
+      allConfirmed = false;
+      if (prior.action !== "MISMATCH_DETECTED") {
+        await confirmLanguageResult(prior.id, "MISMATCH_DETECTED");
+        await notifyMismatch({ campaignName: campaignGroupTag, lang: prior.language_code, campaignId: prior.campaign_id, expectedMessageId: prior.keep_message_id });
+      }
+    }
+  }
+
+  if (allConfirmed && priorResults.length > 0) {
+    await updateExecution(execution.id, { status: "SUCCESS" });
+    await notifyCompletion({ campaignName: campaignGroupTag, winner: execution.winner_variation, languageCount: priorResults.length });
+  }
+}
+
 async function processFamily(family, conversionMetricId) {
   const campaignGroupTag = family.baseName; // interim identifier — see src/family.mjs risk notes
 
@@ -80,6 +113,14 @@ async function processFamily(family, conversionMetricId) {
     console.log(`[${campaignGroupTag}] already processed successfully — skipping (idempotency)`);
     return;
   }
+  if (existing?.status === "AWAITING_MANUAL_ACTION") {
+    await verifyManualCompletion(existing, family, campaignGroupTag);
+    return;
+  }
+  if (existing?.status === "FAILED") {
+    console.log(`[${campaignGroupTag}] previously FAILED (${existing.failure_reason}) — not retrying automatically`);
+    return;
+  }
 
   const completeness = checkFamilyCompleteness(family);
   if (!completeness.complete) {
@@ -88,7 +129,7 @@ async function processFamily(family, conversionMetricId) {
   }
 
   if (!isEnTestReadyToPoll(family.en)) {
-    return; // not in the polling window yet, or already past it without us — see below
+    return; // not in the polling window yet, or already past it without us
   }
 
   const execution = existing || (await createOrGetExecution({
@@ -100,13 +141,13 @@ async function processFamily(family, conversionMetricId) {
   }));
 
   const stats = await fetchVariationStats(family.en.id, conversionMetricId, { key: "last_365_days" });
-  const messages = family.en._messages;
-  if (messages.length !== 2) {
-    await updateExecution(execution.id, { status: "FAILED", failure_reason: `expected 2 EN campaign-messages, found ${messages.length}` });
+  const enMessages = family.en._messages;
+  if (enMessages.length !== 2) {
+    await updateExecution(execution.id, { status: "FAILED", failure_reason: `expected 2 EN campaign-messages, found ${enMessages.length}` });
     await notifyFailure({ campaignName: campaignGroupTag, problem: "EN campaign does not have exactly 2 variations" });
     return;
   }
-  const [msgA, msgB] = messages;
+  const [msgA, msgB] = enMessages;
   const statA = stats.find((s) => s.campaignMessageId === msgA.id);
   const statB = stats.find((s) => s.campaignMessageId === msgB.id);
 
@@ -139,36 +180,18 @@ async function processFamily(family, conversionMetricId) {
     return;
   }
 
-  const winnerMessage = decision.winner === "A" ? msgA : msgB;
   await updateExecution(execution.id, {
-    status: "WINNER_COMPUTED",
     winner_variation: decision.winner,
-    winner_message_id: winnerMessage.id,
     click_rate_a: statA.clickRate, click_rate_b: statB.clickRate,
     placed_order_rate_a: statA.conversionRate, placed_order_rate_b: statB.conversionRate,
-    decided_by: decision.decidedBy, // 'conversion_rate' | 'click_rate_tiebreak'
+    decided_by: decision.decidedBy,
   });
 
-  if (!family.tagVerified) {
-    // Legacy (name-matched, one-campaign-two-message) families can never reach the write path —
-    // there's no supported API to remove one message from that structure (DESIGN.md §7). Report
-    // and stop rather than guess.
-    await updateExecution(execution.id, { status: "FAILED", failure_reason: "family not tag-verified — refusing write actions on a name-matched, legacy-structure family (DESIGN.md §3/§7)" });
-    await notifyFailure({
-      campaignName: campaignGroupTag,
-      winner: decision.winner,
-      problem: "Family identified by name only (legacy single-campaign structure), not tag-verified dual campaigns",
-      reason: "Write actions only run on dual_campaign families built with group:/lang:/variant: tags. Rebuild this family's language campaigns as two tagged single-message campaigns per language to enable automation.",
-    });
-    return;
-  }
-
-  // Validate every language's TWO campaigns (Variant A / Variant B) — all-or-nothing per
-  // DESIGN.md §6/§10. Only dual_campaign families reach here (gate above).
+  // Validate every language campaign — all-or-nothing per DESIGN.md §6/§10.
   const languageResults = [];
-  for (const [lang, slot] of family.languages) {
-    const result = validateDualCampaignLanguage({ campaignA: slot.a, campaignB: slot.b, expectedLangCode: lang });
-    languageResults.push({ lang, slot, result });
+  for (const [lang, campaign] of family.languages) {
+    const result = validateLanguageCampaign({ campaign, messages: campaign._messages, expectedLangCode: lang });
+    languageResults.push({ lang, campaign, result });
   }
   const anyFailed = languageResults.some((r) => !r.result.passed);
   if (anyFailed) {
@@ -183,45 +206,34 @@ async function processFamily(family, conversionMetricId) {
     return;
   }
 
-  // Write path — schedule the winning variant's campaign, archive the losing one. Guarded by
-  // klaviyoClient's dry-run/automation-enabled check; nothing below actually reaches Klaviyo
-  // unless both AUTOMATION_ENABLED=true and DRY_RUN=false. NOT YET RUN FOR REAL — needs Phase 5
-  // (controlled test campaign) before this touches a real send. See computeTargetSendDate()'s
-  // doc comment for the biggest open unknown (exact send-date heuristic).
-  const targetDate = computeTargetSendDate();
-  for (const { lang, slot } of languageResults) {
-    const winnerCampaign = decision.winner === "A" ? slot.a : slot.b;
-    const loserCampaign = decision.winner === "A" ? slot.b : slot.a;
-
-    await klaviyoPatch(`/campaigns/${winnerCampaign.id}`, {
-      data: {
-        type: "campaign",
-        id: winnerCampaign.id,
-        attributes: {
-          send_strategy: {
-            method: "static",
-            options: { datetime: `${targetDate}T10:00:00`, is_local: true, send_past_recipients_immediately: false },
-          },
-        },
-      },
+  // Identify which message to keep vs delete per language, using the same label-based signal
+  // as the EN campaign (DESIGN.md §8) — never array order.
+  const notifyRows = [];
+  for (const { lang, campaign } of languageResults) {
+    const { messageA, messageB } = identifyVariationMessages(campaign._messages);
+    const keep = decision.winner === "A" ? messageA : messageB;
+    const del = decision.winner === "A" ? messageB : messageA;
+    await upsertLanguageResult({
+      executionId: execution.id,
+      languageCode: lang,
+      campaignId: campaign.id,
+      keepMessageId: keep.id,
+      deleteMessageId: del.id,
+      validationStatus: "PASSED",
+      validationFailures: [],
+      action: "AWAITING_MANUAL_ACTION",
     });
-    await klaviyoPost("/campaign-send-jobs", {
-      data: { type: "campaign-send-job", id: winnerCampaign.id },
-    });
-    await klaviyoPatch(`/campaigns/${loserCampaign.id}`, {
-      data: { type: "campaign", id: loserCampaign.id, attributes: { archived: true } },
-    });
-    console.log(`[${campaignGroupTag}] ${lang}: scheduled variant ${decision.winner} (${winnerCampaign.id}), archived the other (${loserCampaign.id})`);
+    notifyRows.push({ lang, campaignId: campaign.id, keepMessageId: keep.id, deleteMessageId: del.id });
   }
 
-  await updateExecution(execution.id, { status: "SUCCESS" });
-  await notifySuccess({
+  await updateExecution(execution.id, { status: "AWAITING_MANUAL_ACTION" });
+  await notifyWinnerReady({
     campaignName: campaignGroupTag,
     winner: decision.winner,
     clickRateA: statA.clickRate, clickRateB: statB.clickRate,
     placedOrderRateA: statA.conversionRate, placedOrderRateB: statB.conversionRate,
     decidedBy: decision.decidedBy,
-    languageCount: languageResults.length,
+    languageResults: notifyRows,
   });
 }
 

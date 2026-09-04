@@ -127,15 +127,17 @@ now does both, and treats them as different trust levels rather than blending th
   language, cross-checked against the `(xx)` name suffix — a mismatch is flagged, not silently
   resolved). That family is marked `tagVerified: true`.
 - Everything else falls back to name matching, marked `tagVerified: false`.
-- **`src/run.mjs` refuses to take any write action (delete a losing variation, schedule a send)
-  on a family that isn't `tagVerified`** — a name-matched family only ever gets read/validated/
-  reported on, never acted on. This means nothing breaks or becomes falsely-automatable today
-  (every real campaign currently has empty tags, verified in Phase 1 discovery) — write actions
-  unlock automatically, per family, the first time your team tags one.
 
-No tags exist in the account yet, so until your team starts adding `group:`/`lang:` tags when
-building campaigns, every family the automation sees will be report-only. That's an intentional
-fail-safe, not a bug to fix.
+Note the stakes here changed after §7's write-path decision below: since the automation never
+deletes or sends anything itself (it hands off to a human via Slack), a misidentified
+name-matched family leads to a wrong *notification*, not an unattended destructive action. Still
+worth getting right — a human could act on a wrong notification without double-checking — so
+`tagVerified` is tracked and worth adopting, just no longer the hard gate it would have been
+under the rejected write-capable design.
+
+No tags exist in the account yet. Name-based matching (documented risks above) is what every
+family the automation sees will use until your team starts adding `group:`/`lang:` tags — that's
+the current normal state, not a bug to fix.
 
 ---
 
@@ -275,27 +277,33 @@ two-message campaign.** Whatever your team's manual delete action in the Klaviyo
 calls, it isn't part of the public API surface this project is restricted to (per your own rule
 against undocumented endpoints) — so the automation cannot literally replicate that click today.
 
-Three ways forward, **needs your decision, not mine**:
+Three ways forward were put to you. A fourth option (restructuring into two single-message
+campaigns per language, letting the automation schedule/archive within the supported API) was
+tried and explicitly rejected on 2026-09-03 — you want to stay at 14 language campaigns, both
+variations in one. Also confirmed: `POST /api/campaign-send-jobs` only takes a campaign `id`, no
+message selection, and there's no "primary message" concept on the campaign resource either — so
+sending a two-message campaign as-is would send both to the same list. Combined with no delete
+capability, there's no way for the automation to safely finish this step itself while keeping the
+14-campaign structure.
 
-1. **Restructure language drafts into two separate single-message campaigns per language**
-   (e.g. "xx — Variant A" and "xx — Variant B", both `"static"`-strategy, both Draft). The
-   automation schedules whichever matches the winner and `archive`s the other
-   (`PATCH /api/campaigns/{id}` with `archived: true` — a real, documented, fully reversible
-   attribute, not a delete). Stays entirely within the supported stable API, and is arguably
-   safer than deletion. Real cost: doubles your language-campaign count per send (14 → 28), and
-   is a genuine change to how your team builds these drafts.
-2. **Keep today's process, automation stops short of the delete step.** The automation computes
-   and announces the winner (Slack notification, audit log) and validates everything else, but a
-   human still does the actual "delete the loser, hit send" step manually. Real cost: the most
-   error-prone, most time-consuming part of the current manual process (§3 of your original
-   spec, steps 7–11) stays manual — this only automates winner detection, not full execution.
-3. **Wait for the omnichannel Campaigns API (currently `.pre` beta, GA not before 2026-10-15)** —
-   its four-level resource model (campaign / campaign-audience / campaign-message /
-   campaign-variation) suggests a real "delete a variation" concept may land there. Not usable
-   now per your own rule against beta functionality in production; revisit once it's GA.
+**Decision (2026-09-03): Option 2 — the automation stops at winner detection.** It computes the
+winner, validates all 14 language campaigns, and identifies (via `identifyVariationMessages()`,
+label-based, DESIGN.md §8) exactly which message to keep and which to delete per language — then
+hands off to a human via Slack (`notifyWinnerReady()`) with that exact list, rather than guessing
+or attempting an unsupported write. A human deletes the losing message and sends, same manual
+click as today, just with the winner already decided and double-checked.
 
-`src/run.mjs`'s write path currently stops with an explicit `FAILED` status and Slack alert
-rather than guessing at any of these — see the code comment there.
+**Closing the loop**: the automation doesn't just fire the notification and forget. On each
+subsequent run, `verifyManualCompletion()` re-checks every language campaign that's still
+`AWAITING_MANUAL_ACTION`: if it now has exactly one message and that message's id matches the
+computed winner, it's marked `CONFIRMED_SENT`; once every language in a family is confirmed, the
+family flips to `SUCCESS` and a completion notification fires. If a campaign ends up with one
+message that does *not* match the winner — someone deleted the wrong one — that's a
+`notifyMismatch()` alert, once, not a silent miss.
+
+Option 3 (wait for the omnichannel Campaigns API, `.pre` beta, GA not before 2026-10-15) remains
+a real future path if a proper "delete a variation" capability lands there — worth revisiting
+then, not now, per your own rule against beta functionality in production.
 
 ---
 
@@ -348,6 +356,13 @@ Split into companion documents to keep this one readable:
 ---
 
 ## 11. Open decisions before Phase 1 (live discovery) can start
+
+**All resolved as of 2026-09-03** (kept below as a record of what was asked). One update worth
+flagging: since §7's final decision means the automation never writes to Klaviyo at all, the
+`campaigns:write` scope mentioned in point 1 below is never needed, permanently — not just
+deferred to a later phase. The API key can stay read-only (`campaigns:read`, `metrics:read`,
+`tags:read`) for the life of this project.
+
 
 1. **Klaviyo private API key** — create one scoped to (initially, read-only):
    `campaigns:read`, `metrics:read`, `tags:read`. Do not grant `campaigns:write` yet — that's only
