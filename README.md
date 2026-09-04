@@ -38,6 +38,9 @@ cp .env.example .env   # fill in KLAVIYO_API_KEY at minimum
   This is what the Render Cron Job invokes every 5 minutes in production — reads env vars
   directly from the process (Render injects them), no `.env` file involved.
 - `npm run run:local` — same thing, but loads `.env` first, for running it on your own machine.
+- `npm run migrate` — applies `migrations/*.sql` against `DATABASE_URL` (from `.env` locally, or
+  export it inline for a one-off run against a remote database). Safe to re-run; only run once
+  per fresh database in practice.
 
 ## Safety defaults
 
