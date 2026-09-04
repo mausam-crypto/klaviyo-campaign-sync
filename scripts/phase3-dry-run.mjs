@@ -13,6 +13,7 @@ async function listRecentEmailCampaigns() {
         "page[size]": "50",
         "fields[campaign]": "name,status,archived,send_strategy,audiences,send_options,tracking_options",
         "fields[campaign-message]": "definition",
+        "fields[tag]": "name",
       }).toString()
   );
   if (!res.ok) throw new Error(`Failed to list campaigns: ${res.status}`);
@@ -24,6 +25,9 @@ async function listRecentEmailCampaigns() {
     ...c,
     _messages: (c.relationships?.["campaign-messages"]?.data || [])
       .map((ref) => included.get(`${ref.type}:${ref.id}`))
+      .filter(Boolean),
+    _tagNames: (c.relationships?.tags?.data || [])
+      .map((ref) => included.get(`${ref.type}:${ref.id}`)?.attributes?.name)
       .filter(Boolean),
   }));
 }

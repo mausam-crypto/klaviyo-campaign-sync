@@ -16,6 +16,21 @@
 //   English string identifiable across all 14 languages.
 
 const LANGUAGE_SUFFIX = /\s*\(([a-z]{2})\)\s*$/i;
+const GROUP_TAG = /^group:(.+)$/;
+const LANG_TAG = /^lang:([a-z]{2})$/i;
+
+/** Reads a campaign's tag names (already-`include`d tag resources) and pulls out the
+ *  `group:<slug>` / `lang:<code>` pair, if present. Returns null if neither tag is set. */
+export function readCampaignTags(tagNames) {
+  let group = null, lang = null;
+  for (const name of tagNames || []) {
+    const g = GROUP_TAG.exec(name);
+    if (g) group = g[1];
+    const l = LANG_TAG.exec(name);
+    if (l) lang = l[1].toLowerCase();
+  }
+  return group || lang ? { group, lang } : null;
+}
 
 /** Splits "Some subject (fr)" into { baseName: "Some subject", langCode: "fr" }. Returns null if
  *  the name doesn't end in a recognized "(xx)" language suffix. */
@@ -29,31 +44,59 @@ export function parseCampaignName(name) {
 }
 
 /**
- * Groups a flat campaign list into families by exact base-name match (case-sensitive on
- * purpose — a base name that doesn't match byte-for-byte across languages is exactly the drift
- * risk called out above, and should surface as a missing-language validation failure rather
- * than being fuzzy-matched).
+ * Groups a flat campaign list into families. Prefers the tag-based `group:`/`lang:` convention
+ * (DESIGN.md §3) when a campaign carries those tags — those families are marked
+ * `tagVerified: true` and are the only ones the write path (deleting a losing variation,
+ * scheduling) is allowed to act on. Everything else falls back to name matching (exact
+ * base-name match, case-sensitive on purpose — drift across 14 translations is exactly the risk
+ * documented above) and is marked `tagVerified: false`: usable for read-only reporting and
+ * validation dry-runs, never for a write action. A tag-based family and a name-based family are
+ * never merged even if they'd represent "the same" real campaign family — that keeps the
+ * verified/unverified line unambiguous rather than something that could quietly blur.
+ *
+ * Expects each campaign object to carry `_tagNames` (array of this campaign's tag name strings,
+ * populated by the caller from the `tags` include) alongside the usual `attributes.name`.
  */
 export function groupCampaignsByFamily(campaigns) {
-  const families = new Map(); // baseName -> { en, languages: Map<langCode, campaign> }
+  const families = new Map(); // key -> { en, languages: Map<langCode, campaign>, tagVerified }
 
   for (const c of campaigns) {
-    const parsed = parseCampaignName(c.attributes?.name);
-    if (!parsed) continue; // no recognizable "(xx)" suffix — not part of this identification scheme
-    const { baseName, langCode } = parsed;
-    if (!families.has(baseName)) {
-      families.set(baseName, { baseName, en: null, languages: new Map() });
-    }
-    const family = families.get(baseName);
-    if (langCode === "en") {
-      if (family.en) {
-        family.enConflict = true; // more than one "(en)" campaign shares this base name — ambiguous
+    const tagInfo = readCampaignTags(c._tagNames);
+    const nameInfo = parseCampaignName(c.attributes?.name);
+
+    let key, langCode, tagVerified;
+    if (tagInfo?.group) {
+      key = `tag:${tagInfo.group}`;
+      langCode = (tagInfo.lang || nameInfo?.langCode || "").toLowerCase();
+      tagVerified = true;
+      if (tagInfo.lang && nameInfo && tagInfo.lang !== nameInfo.langCode) {
+        c._tagNameLangMismatch = true; // lang: tag disagrees with the "(xx)" name suffix
       }
+    } else if (nameInfo) {
+      key = `name:${nameInfo.baseName}`;
+      langCode = nameInfo.langCode;
+      tagVerified = false;
+    } else {
+      continue; // neither a group tag nor a recognizable "(xx)" suffix — not in scope
+    }
+
+    if (!families.has(key)) {
+      families.set(key, {
+        baseName: nameInfo?.baseName || tagInfo?.group,
+        en: null,
+        languages: new Map(),
+        tagVerified,
+      });
+    }
+    const family = families.get(key);
+
+    if (langCode === "en") {
+      if (family.en) family.enConflict = true;
       family.en = c;
     } else {
       if (family.languages.has(langCode)) {
         family.languageConflicts = family.languageConflicts || [];
-        family.languageConflicts.push(langCode); // duplicate language for this family — ambiguous
+        family.languageConflicts.push(langCode);
       }
       family.languages.set(langCode, c);
     }

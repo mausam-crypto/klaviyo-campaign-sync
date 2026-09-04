@@ -119,12 +119,22 @@ The `"(xx)"` name suffix becomes a **secondary cross-check only**: if a campaign
 language disagrees with its `lang:` tag, that's a validation failure (STOP), not something the
 automation silently resolves.
 
-**Why this needs your sign-off**: it's a change to how you build campaigns in the Klaviyo UI (two
-tags per campaign, ~15 clicks per send), not just a backend implementation detail. If you'd rather
-not add tags, the fallback is name-based grouping by common subject-line stem with the `(xx)`
-suffix stripped — I can build that, but per your own instructions I need to flag it explicitly as
-higher-risk (subject lines can collide, get retyped slightly differently per language, etc.) and
-you'd be accepting that risk knowingly rather than it being silently assumed.
+**Decision (2026-09-03): implemented as designed above, at your direction.** `src/family.mjs`
+now does both, and treats them as different trust levels rather than blending them:
+
+- A campaign carrying a `group:<slug>` tag is grouped by that tag (`lang:<code>` giving its
+  language, cross-checked against the `(xx)` name suffix — a mismatch is flagged, not silently
+  resolved). That family is marked `tagVerified: true`.
+- Everything else falls back to name matching, marked `tagVerified: false`.
+- **`src/run.mjs` refuses to take any write action (delete a losing variation, schedule a send)
+  on a family that isn't `tagVerified`** — a name-matched family only ever gets read/validated/
+  reported on, never acted on. This means nothing breaks or becomes falsely-automatable today
+  (every real campaign currently has empty tags, verified in Phase 1 discovery) — write actions
+  unlock automatically, per family, the first time your team tags one.
+
+No tags exist in the account yet, so until your team starts adding `group:`/`lang:` tags when
+building campaigns, every family the automation sees will be report-only. That's an intentional
+fail-safe, not a bug to fix.
 
 ---
 
@@ -263,23 +273,51 @@ how your language-campaign drafts are actually built today:
   `PATCH /api/campaign-messages/{id}` (confirmed to exist, `campaigns:write` scope), rather than
   deleting anything.
 
-**Resolved by live-account inspection (2026-09-03), pending one confirmation from your team.**
-Inspected all 14 real language campaigns in the "Why the order of your skincare can matter"
-family: every single one has exactly **one** campaign-message, always with
-`send_strategy.method: "static"`. None had two. The strong working hypothesis — consistent
-across all 14, not a one-off — is **(b)**: a `"static"`-strategy (non-A/B) campaign structurally
-holds only one message per channel in Klaviyo, so there is no second variation to select between
-or delete in the first place; whoever prepares these drafts sets/edits that single message's
-content once the winner is known. Supporting evidence: the French campaign's message was created
-at 07:11 UTC today — after the EN test's result was already knowable — with subject/preview text
-that's an exact translation of EN Variation A's (the actual winner).
+**Corrected by you directly (2026-09-03) — the single-message read from Phase 1 discovery was a
+false signal, not the real shape.** You confirmed: language drafts really do carry both Variation
+A and Variation B, and your team manually deletes the losing one once the EN winner is known. The
+"every campaign I looked at had exactly one message" finding was simply catching each one *after*
+that manual deletion had already happened for that day's send — not evidence the drafts start
+with one.
 
-This is an empirical finding, not something read from documentation, so it needs one direct
-confirmation from whoever on your team builds these drafts: **do language campaigns ever exist
-with two messages, or do they always start as one and get edited once the winner's known?** If
-confirmed, v1 implementation is simply: `PATCH /api/campaign-messages/{id}` with the winning
-variation's `content` fields (subject, preview_text, body) copied over — never a delete call,
-consistent with §7 above.
+**This creates a real, verified blocker**, checked directly against the raw stable OpenAPI spec
+(`2026-09-03`), not inferred:
+
+- `DELETE /api/campaign-messages/{id}` — **does not exist.** Only `GET` and `PATCH` are defined
+  for that path in the spec.
+- `PATCH`/`DELETE` on the campaign → campaign-messages relationship (the JSON:API pattern that
+  would let you unlink one message without deleting the resource) — **does not exist.** Only
+  `GET /api/campaigns/{id}/relationships/campaign-messages` is defined; read-only.
+- `POST /api/campaign-clone` — **exists**, but always clones the entire campaign including every
+  message, with no field to select a subset. Cloning doesn't produce a single-message campaign
+  either.
+
+**There is no documented, stable Klaviyo API operation that removes one variation from a
+two-message campaign.** Whatever your team's manual delete action in the Klaviyo UI actually
+calls, it isn't part of the public API surface this project is restricted to (per your own rule
+against undocumented endpoints) — so the automation cannot literally replicate that click today.
+
+Three ways forward, **needs your decision, not mine**:
+
+1. **Restructure language drafts into two separate single-message campaigns per language**
+   (e.g. "xx — Variant A" and "xx — Variant B", both `"static"`-strategy, both Draft). The
+   automation schedules whichever matches the winner and `archive`s the other
+   (`PATCH /api/campaigns/{id}` with `archived: true` — a real, documented, fully reversible
+   attribute, not a delete). Stays entirely within the supported stable API, and is arguably
+   safer than deletion. Real cost: doubles your language-campaign count per send (14 → 28), and
+   is a genuine change to how your team builds these drafts.
+2. **Keep today's process, automation stops short of the delete step.** The automation computes
+   and announces the winner (Slack notification, audit log) and validates everything else, but a
+   human still does the actual "delete the loser, hit send" step manually. Real cost: the most
+   error-prone, most time-consuming part of the current manual process (§3 of your original
+   spec, steps 7–11) stays manual — this only automates winner detection, not full execution.
+3. **Wait for the omnichannel Campaigns API (currently `.pre` beta, GA not before 2026-10-15)** —
+   its four-level resource model (campaign / campaign-audience / campaign-message /
+   campaign-variation) suggests a real "delete a variation" concept may land there. Not usable
+   now per your own rule against beta functionality in production; revisit once it's GA.
+
+`src/run.mjs`'s write path currently stops with an explicit `FAILED` status and Slack alert
+rather than guessing at any of these — see the code comment there.
 
 ---
 

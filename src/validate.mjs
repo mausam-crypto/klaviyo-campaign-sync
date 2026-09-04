@@ -6,6 +6,16 @@
 
 const NOT_YET_IMPLEMENTED = ["idempotency_no_prior_execution", "no_duplicate_send", "content_unchanged_since_discovery"];
 
+/** Matches campaign-messages to "A"/"B" by their `label` text, the same durable-ish signal EN
+ *  campaign-messages use ("... Variation A" / "... Variation B"). See src/family.mjs and
+ *  DESIGN.md §8 for why this is label-based, not order-based — and why it's still only a
+ *  display-text signal, cross-checked here by requiring both to be found, not assumed. */
+export function identifyVariationMessages(messages) {
+  const byLabel = (suffix) =>
+    messages.find((m) => new RegExp(`variation\\s*${suffix}\\s*$`, "i").test(m.attributes?.definition?.label || ""));
+  return { messageA: byLabel("a"), messageB: byLabel("b") };
+}
+
 export function validateLanguageCampaign({ campaign, messages, expectedLangCode }) {
   const failures = [];
   const attrs = campaign.attributes || {};
@@ -17,15 +27,23 @@ export function validateLanguageCampaign({ campaign, messages, expectedLangCode 
     failures.push({ check: "not_already_scheduled_or_sent", detail: `status "${attrs.status}" indicates this campaign is past draft` });
   }
 
-  if (!messages || messages.length === 0) {
-    failures.push({ check: "has_message", detail: "no campaign-messages found" });
-  } else if (messages.length > 1) {
-    // Contradicts the empirical Phase 1 finding (every real language campaign had exactly one
-    // message) — treat as unexpected structure needing manual review, not something to guess at.
+  // Confirmed directly by you (2026-09-03): language drafts really do carry both A and B
+  // messages, with the losing one manually deleted once the winner's known — the "always exactly
+  // one message" read from live data during discovery was just campaigns caught after that
+  // manual deletion already happened, not the true pre-decision shape. Validate for two.
+  if (!messages || messages.length !== 2) {
     failures.push({
-      check: "expected_single_message",
-      detail: `found ${messages.length} campaign-messages; DESIGN.md §7's PATCH-based approach assumes exactly one`,
+      check: "has_both_variations",
+      detail: `found ${messages?.length ?? 0} campaign-messages, expected exactly 2 (Variation A + Variation B)`,
     });
+  } else {
+    const identified = identifyVariationMessages(messages);
+    if (!identified.messageA || !identified.messageB) {
+      failures.push({
+        check: "variations_identifiable",
+        detail: `could not identify both "Variation A" and "Variation B" by label among: ${messages.map((m) => JSON.stringify(m.attributes?.definition?.label)).join(", ")}`,
+      });
+    }
   }
 
   const audiences = attrs.audiences || {};
@@ -37,6 +55,12 @@ export function validateLanguageCampaign({ campaign, messages, expectedLangCode 
     failures.push({ check: "send_and_tracking_options_present", detail: "send_options or tracking_options missing" });
   }
 
+  // UNVERIFIED: every campaign inspected during Phase 1 already had send_strategy configured,
+  // but all of those were past Draft (already scheduled/sent) — we haven't yet confirmed whether
+  // a language campaign in true pre-decision Draft state already has send_strategy set to
+  // static/10am/local, or whether that's only added at the final scheduling step. If it turns
+  // out to be the latter, this check needs to move from "validate" to "part of what scheduling
+  // sets," not something a still-undecided draft is expected to already satisfy.
   const strategy = attrs.send_strategy;
   if (!strategy || strategy.method !== "static") {
     failures.push({ check: "send_strategy_is_static", detail: `send_strategy.method is "${strategy?.method}", expected "static" for a scheduled single send` });

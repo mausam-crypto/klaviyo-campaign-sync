@@ -6,7 +6,8 @@
 // DB is still pending. AUTOMATION_ENABLED defaults to false specifically so this can be deployed
 // and iterated on safely before that first real run.
 import { config } from "./config.mjs";
-import { klaviyoGet, klaviyoPatch } from "./klaviyoClient.mjs";
+import { klaviyoGet } from "./klaviyoClient.mjs";
+// klaviyoPatch is not yet used — the write path is intentionally blocked, see below.
 import { lookupPlacedOrderMetricId } from "./metrics.mjs";
 import { fetchVariationStats } from "./reporting.mjs";
 import { classifySnapshot, decideWinner } from "./winner.mjs";
@@ -25,6 +26,7 @@ async function listRecentEmailCampaigns() {
         "page[size]": "50",
         "fields[campaign]": "name,status,send_strategy,send_time,audiences,send_options,tracking_options",
         "fields[campaign-message]": "definition",
+        "fields[tag]": "name",
       }).toString()
   );
   if (!res.ok) throw new Error(`Failed to list campaigns: ${res.status}`);
@@ -34,6 +36,9 @@ async function listRecentEmailCampaigns() {
     ...c,
     _messages: (c.relationships?.["campaign-messages"]?.data || [])
       .map((ref) => included.get(`${ref.type}:${ref.id}`))
+      .filter(Boolean),
+    _tagNames: (c.relationships?.tags?.data || [])
+      .map((ref) => included.get(`${ref.type}:${ref.id}`)?.attributes?.name)
       .filter(Boolean),
   }));
 }
@@ -151,21 +156,34 @@ async function processFamily(family, conversionMetricId) {
     return;
   }
 
-  // Write path — content patch + schedule. Guarded by klaviyoClient's dry-run/automation-enabled
-  // check; nothing below actually reaches Klaviyo unless both AUTOMATION_ENABLED=true and
-  // DRY_RUN=false.
-  const winnerContent = winnerMessage.attributes?.definition?.content;
-  for (const { lang, campaign } of languageResults) {
-    const [message] = campaign._messages;
-    await klaviyoPatch(`/campaign-messages/${message.id}`, {
-      data: {
-        type: "campaign-message",
-        id: message.id,
-        attributes: { definition: { channel: "email", content: winnerContent } },
-      },
+  if (!family.tagVerified) {
+    await updateExecution(execution.id, { status: "FAILED", failure_reason: "family not tag-verified — refusing write actions on a name-matched family (DESIGN.md §3)" });
+    await notifyFailure({
+      campaignName: campaignGroupTag,
+      winner: decision.winner,
+      problem: "Family identified by name only, not by group:/lang: tags",
+      reason: "Write actions (removing the losing variation, scheduling) are only permitted on tag-verified families. Add group:/lang: tags to this family's campaigns to enable automation.",
     });
-    console.log(`[${campaignGroupTag}] ${lang}: content patched to winning variation`);
+    return;
   }
+
+  // WRITE PATH — BLOCKED PENDING A DESIGN DECISION, NOT YET IMPLEMENTED.
+  // Verified against the raw stable OpenAPI spec (2026-09-03): there is no DELETE endpoint for a
+  // single campaign-message, no PATCH/DELETE on the campaign -> campaign-messages relationship,
+  // and POST /api/campaign-clone always clones every message with no subset selection. There is
+  // no documented, stable way to remove one variation from a two-message campaign, even though
+  // that's confirmed to be your team's real manual process today. See DESIGN.md §7 "Variation
+  // selection" for the options put to you (separate single-message campaigns per language,
+  // archived instead of deleted; a manual hybrid; or waiting on the 2026-10-15 beta GA) — this
+  // function must not proceed until that's resolved, so it stops here rather than guessing.
+  await updateExecution(execution.id, { status: "FAILED", failure_reason: "write path not implemented — no supported API removes a losing variation (see DESIGN.md §7)" });
+  await notifyFailure({
+    campaignName: campaignGroupTag,
+    winner: decision.winner,
+    problem: "Winner computed and validated, but the write path is intentionally not implemented yet",
+    reason: "No documented Klaviyo API removes one variation from a two-message campaign — needs a decision, see DESIGN.md §7",
+  });
+  return;
 
   await updateExecution(execution.id, { status: "SUCCESS" });
   await notifySuccess({
