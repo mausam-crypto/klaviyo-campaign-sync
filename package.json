@@ -7,7 +7,8 @@
     "discover": "node --env-file=.env scripts/discover.mjs",
     "phase2": "node --env-file=.env scripts/phase2-validate.mjs",
     "phase3": "node --env-file=.env scripts/phase3-dry-run.mjs",
-    "run": "node --env-file=.env src/run.mjs"
+    "run": "node src/run.mjs",
+    "run:local": "node --env-file=.env src/run.mjs"
   },
   "dependencies": {
     "pg": "^8.13.1"

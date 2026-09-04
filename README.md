@@ -35,7 +35,9 @@ cp .env.example .env   # fill in KLAVIYO_API_KEY at minimum
 - `npm run phase2` — winner-algorithm validation against real historical data, no live calls.
 - `npm run phase3` — live, read-only family-matching + validation dry run.
 - `npm run run` — the full pipeline (`src/run.mjs`), gated by `AUTOMATION_ENABLED` and `DRY_RUN`.
-  This is what the Render Cron Job invokes every 5 minutes in production.
+  This is what the Render Cron Job invokes every 5 minutes in production — reads env vars
+  directly from the process (Render injects them), no `.env` file involved.
+- `npm run run:local` — same thing, but loads `.env` first, for running it on your own machine.
 
 ## Safety defaults
 
