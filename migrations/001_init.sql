@@ -11,8 +11,7 @@ create table campaign_group_executions (
   winner_message_id   text,
   click_rate_a        numeric, click_rate_b       numeric,
   placed_order_rate_a numeric, placed_order_rate_b numeric,
-  conversion_diff_pct numeric,
-  conversion_override boolean,
+  decided_by          text, -- 'conversion_rate' | 'click_rate_tiebreak'
   poll_window_start   timestamptz,
   poll_window_end     timestamptz,
   snapshot_recipients_a integer, snapshot_recipients_b integer,

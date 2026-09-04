@@ -16,8 +16,9 @@ export const config = {
   automationEnabled: bool(process.env.AUTOMATION_ENABLED, false),
   dryRun: bool(process.env.DRY_RUN, true),
 
-  // Business rule constants — defined once, here only (DESIGN.md §4)
-  conversionOverrideThreshold: num(process.env.CONVERSION_OVERRIDE_THRESHOLD, 0.10),
+  // Business rule (DESIGN.md §4, revised 2026-09-03): Placed Order Rate (conversion) is the sole
+  // primary metric, Click Rate only breaks an exact tie — no threshold/override concept needed
+  // anymore. Nothing to configure here; kept as a comment marker for where that used to live.
 
   // Your current native A/B config (test size 20%, 10%/10% split, 24h duration) — used only to
   // classify whether a Reporting API snapshot looks pre- or post-rollout. Not written to Klaviyo;

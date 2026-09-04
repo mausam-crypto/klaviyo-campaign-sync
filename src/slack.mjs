@@ -15,15 +15,18 @@ async function post(text) {
   }
 }
 
-export async function notifySuccess({ campaignName, winner, clickRateA, clickRateB, placedOrderRateA, placedOrderRateB, overrideTriggered, languageCount }) {
+export async function notifySuccess({ campaignName, winner, clickRateA, clickRateB, placedOrderRateA, placedOrderRateB, decidedBy, languageCount }) {
   const pct = (n) => `${(n * 100).toFixed(2)}%`;
+  const decidedByText = decidedBy === "click_rate_tiebreak"
+    ? "Click Rate (conversion rates were exactly tied)"
+    : "Placed Order Rate (conversion) — the primary metric";
   await post(
     `:white_check_mark: *Klaviyo Campaign Automation Completed*\n\n` +
       `*Campaign:* ${campaignName}\n` +
-      `*Winner:* Variation ${winner}\n\n` +
-      `*Click Rate:* A = ${pct(clickRateA)}, B = ${pct(clickRateB)}\n` +
-      `*Placed Order Rate:* A = ${pct(placedOrderRateA)}, B = ${pct(placedOrderRateB)}\n\n` +
-      `*Conversion override:* ${overrideTriggered ? "Yes" : "No — difference below 10%"}\n\n` +
+      `*Winner:* Variation ${winner}\n` +
+      `*Decided by:* ${decidedByText}\n\n` +
+      `*Placed Order Rate:* A = ${pct(placedOrderRateA)}, B = ${pct(placedOrderRateB)}\n` +
+      `*Click Rate:* A = ${pct(clickRateA)}, B = ${pct(clickRateB)}\n\n` +
       `${languageCount} language campaigns processed.\n` +
       `All campaigns scheduled for 10:00 AM recipient local time.\n\n` +
       `*Status:* SUCCESS`

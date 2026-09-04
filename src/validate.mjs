@@ -1,4 +1,14 @@
 // Per-language-campaign validation — DESIGN.md §6 / original spec §10.
+//
+// Two shapes exist, matching src/family.mjs's `structure` field:
+//  - `legacy_single_campaign`: the real shape every campaign in the account has today — one
+//    campaign, two messages, loser deleted manually. `validateLanguageCampaign()` below.
+//  - `dual_campaign`: the new shape approved 2026-09-03 to work around the missing
+//    delete-campaign-message API (DESIGN.md §7) — two separate single-message campaigns per
+//    language, tagged `variant:a` / `variant:b`. `validateDualCampaignLanguage()` below.
+// Only `dual_campaign` families can ever reach the write path (family.tagVerified gate in
+// src/run.mjs) — `validateLanguageCampaign` stays in use for read-only reporting on the
+// already-sent real campaigns discovered so far (see docs/VALIDATION.md).
 // Checks 12/13 (idempotency: "no prior execution for this family+language") and 14 (content-hash
 // drift since discovery) need the Postgres state store, which isn't wired up until Phase 4 —
 // they're stubbed here with an explicit NOT_IMPLEMENTED marker rather than silently skipped, so
@@ -71,6 +81,65 @@ export function validateLanguageCampaign({ campaign, messages, expectedLangCode 
     const timeOfDay = strategy.datetime ? strategy.datetime.slice(11, 16) : null;
     if (timeOfDay !== "10:00") {
       failures.push({ check: "scheduled_time_is_10am", detail: `send_strategy.datetime time-of-day is "${timeOfDay}", expected "10:00"` });
+    }
+  }
+
+  for (const check of NOT_YET_IMPLEMENTED) {
+    failures.push({ check, detail: "not implemented until Phase 4 (Postgres state store)", blocking: false });
+  }
+
+  const blockingFailures = failures.filter((f) => f.blocking !== false);
+  return { passed: blockingFailures.length === 0, failures, langCode: expectedLangCode };
+}
+
+function validateSingleCampaign(campaign, label) {
+  const failures = [];
+  const attrs = campaign?.attributes || {};
+
+  if (!campaign) {
+    failures.push({ check: `${label}_exists`, detail: `Variant ${label} campaign not found` });
+    return failures; // nothing else is checkable without a campaign object
+  }
+  if (attrs.status !== "Draft") {
+    failures.push({ check: `${label}_status_is_draft`, detail: `status is "${attrs.status}", expected "Draft"` });
+  }
+  if (["Scheduled", "Sending", "Sent"].includes(attrs.status) || String(attrs.status).startsWith("Cancelled")) {
+    failures.push({ check: `${label}_not_already_scheduled_or_sent`, detail: `status "${attrs.status}" indicates this campaign is past draft` });
+  }
+  if ((campaign._messages || []).length !== 1) {
+    failures.push({ check: `${label}_has_single_message`, detail: `found ${(campaign._messages || []).length} campaign-messages, expected exactly 1 under the dual-campaign structure` });
+  }
+  if (!attrs.audiences?.included?.length) {
+    failures.push({ check: `${label}_audience_included_non_empty`, detail: "audiences.included is empty" });
+  }
+  if (!attrs.send_options || !attrs.tracking_options) {
+    failures.push({ check: `${label}_send_and_tracking_options_present`, detail: "send_options or tracking_options missing" });
+  }
+  return failures;
+}
+
+/**
+ * Validates a language's TWO campaigns (Variant A / Variant B) under the new dual-campaign
+ * structure. Both must independently pass, and — critical, since these two campaigns are meant
+ * to be the same recipients seeing different content — their audiences must match exactly.
+ * Whichever one turns out to be the loser gets `archived: true` (not deleted) by the write path;
+ * nothing here decides that — this only validates that both are safe to act on.
+ */
+export function validateDualCampaignLanguage({ campaignA, campaignB, expectedLangCode }) {
+  const failures = [
+    ...validateSingleCampaign(campaignA, "a"),
+    ...validateSingleCampaign(campaignB, "b"),
+  ];
+
+  if (campaignA && campaignB) {
+    const audA = campaignA.attributes?.audiences?.included || [];
+    const audB = campaignB.attributes?.audiences?.included || [];
+    const sameAudience = audA.length === audB.length && audA.every((id) => audB.includes(id));
+    if (!sameAudience) {
+      failures.push({
+        check: "same_audience_both_variants",
+        detail: `Variant A audience (${JSON.stringify(audA)}) does not match Variant B audience (${JSON.stringify(audB)})`,
+      });
     }
   }
 

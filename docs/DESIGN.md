@@ -11,9 +11,10 @@ sources) plus decisions that need your sign-off, flagged inline as **DECISION NE
 
 After the EN campaign's native Klaviyo A/B test has run its course, this service:
 
-1. Computes our own winner (Click Rate primary, Placed Order Rate override at ≥10% relative
-   difference) from Klaviyo's Reporting API — independently of whatever Klaviyo's own internal
-   A/B logic does with the EN campaign's remaining 80%.
+1. Computes our own winner (Placed Order Rate is the sole primary metric — whichever variation
+   converts more wins; Click Rate only breaks an exact tie, revised 2026-09-03, see §4) from
+   Klaviyo's Reporting API — independently of whatever Klaviyo's own internal A/B logic does with
+   the EN campaign's remaining 80%.
 2. Finds the 14 language-campaign drafts belonging to the same campaign family.
 3. Validates every one of them.
 4. Schedules the winning variation in each, at 10:00 AM recipient local time.
@@ -31,9 +32,9 @@ was confirmed by reading the actual stable `campaigns.json` OpenAPI spec (revisi
 not inferred. See capability matrix Q2/Q3.
 
 This is actually *convenient* for us, not a blocker: it means the business requirement ("compute
-our own winner via Click Rate + Placed Order override, independent of Klaviyo's own algorithm") is
-the *only* viable approach anyway — there's no Klaviyo-declared winner we could either use or need
-to override.
+our own winner from Placed Order Rate, independent of Klaviyo's own algorithm") is the *only*
+viable approach anyway — there's no Klaviyo-declared winner we could either use or need to
+override.
 
 **Revised after live-account verification (2026-09-03) — this is more subtle than originally
 designed, and the fix below replaces an earlier draft of this section that assumed waiting for
@@ -57,10 +58,10 @@ duration):
   `send_time + TEST_DURATION_HOURS` offset is **not a reliable trigger**; treat
   `TEST_DURATION_HOURS` as an upper bound on when polling needs to be watching closely, not the
   moment itself.
-- **Concrete illustration of why this matters**: applying the §4 algorithm to that real test's
-  (already-contaminated) numbers — A: click 0.569%/conv 0.056%, B: click 0.502%/conv 0.108% —
-  flips the decision to B on the conversion override, directly contradicting the fact that
-  Klaviyo already delivered A to 90% of the list. Computing "our own independent winner" from
+- **Concrete illustration of why this matters**: applying the §4 algorithm (conversion rate
+  primary) to that real test's (already-contaminated) numbers — A: conv 0.056%, B: conv 0.108% —
+  picks B, directly contradicting the fact that Klaviyo already delivered A to 90% of the list.
+  Computing "our own independent winner" from
   post-rollout data isn't independent at all — it's biased toward whichever variation has the
   larger, blended sample.
 
@@ -154,51 +155,28 @@ recipients_A, recipients_B            -- for the completeness/edge-case checks b
 
 ```
 function decideWinner(A, B):
-    # 0. Completeness gate — see §7 for the full edge-case table
+    # 0. Completeness gate — see §5 for the full edge-case table
     if not dataComplete(A) or not dataComplete(B):
         return STOP("incomplete reporting data")
 
-    # 1. Primary metric
-    if A.click_rate == B.click_rate:
-        clickWinner = TIE
-    elif A.click_rate > B.click_rate:
-        clickWinner = A
-    else:
-        clickWinner = B
+    # 1. Primary (and now only) metric: Placed Order Rate. Whichever variation converts
+    #    more wins — no threshold, no override concept. This replaced an earlier
+    #    click-rate-primary / conversion-override design (see git history for the prior
+    #    version) at your explicit direction on 2026-09-03.
+    if A.placed_order_rate != B.placed_order_rate:
+        return A if A.placed_order_rate > B.placed_order_rate else B
 
-    if clickWinner == TIE and A.placed_order_rate == B.placed_order_rate:
-        return STOP("exact tie on both click rate and conversion rate — no safe default")
+    # 2. Exact tie on conversion rate — Click Rate breaks the tie.
+    if A.click_rate != B.click_rate:
+        return A if A.click_rate > B.click_rate else B
 
-    # 2. Conversion override — ONLY applies when one side's Placed Order Rate is
-    #    at least 10% relatively higher than the other's.
-    #    relative_diff = |rate_high - rate_low| / rate_low   (guarding rate_low == 0, see §7)
-    higherConv = A if A.placed_order_rate > B.placed_order_rate else B
-    lowerConv  = B if higherConv == A else A
-    if lowerConv.placed_order_rate == 0:
-        convOverrideEligible = higherConv.placed_order_rate > 0   # any positive vs zero
-        relDiff = INFINITY if convOverrideEligible else 0
-    else:
-        relDiff = (higherConv.placed_order_rate - lowerConv.placed_order_rate) / lowerConv.placed_order_rate
-
-    convOverrideTriggers = relDiff >= 0.10   # the 10% threshold, defined once, here only
-
-    if convOverrideTriggers:
-        winner = higherConv
-    elif clickWinner == TIE:
-        return STOP("click rate tied and conversion difference below 10% — no deterministic winner")
-    else:
-        winner = clickWinner
-
-    return winner
+    # 3. Tied on both — no safe default.
+    return STOP("exact tie on both conversion rate and click rate — no safe default")
 ```
 
-Worked examples from your spec both check out under this pseudocode:
-- CR 5.00/4.80, POR 1.00/1.15 → relDiff = (1.15−1.00)/1.00 = 15% ≥ 10% → **B overrides** ✔
-- CR 5.00/4.80, POR 1.00/1.05 → relDiff = 5% < 10% → **A wins on Click Rate** ✔
-
-The 10% threshold is a **relative** difference (percentage-of-the-lower-value), matching your
-worked examples exactly — this needed to be pinned down explicitly since "10% higher" is ambiguous
-between relative and absolute-percentage-point without an example to check against.
+This is a deliberately simple rule: implemented in `src/winner.mjs::decideWinner()`, validated
+in `scripts/phase2-validate.mjs`. There is no configurable threshold to tune — see §4 (old) in
+git history if you ever want the prior click-rate-primary / 10%-override version back.
 
 ---
 
@@ -207,12 +185,12 @@ between relative and absolute-percentage-point without an example to check again
 | Condition | Detection | Action |
 |---|---|---|
 | A or B has no metrics row at all | Reporting API returns fewer than 2 groups for the campaign | STOP |
-| click_rate missing/null on either side | field absent or null in response | STOP |
-| placed_order_rate missing/null | field absent or null | STOP — conversion override cannot be safely evaluated, fall back is **not** to silently skip the override, it's to halt, since Placed Order data being unavailable could mean it never populated, not that it's genuinely zero |
+| placed_order_rate missing/null on either side | field absent or null in response | STOP — this is now the primary metric, so missing data here is disqualifying, not just for an override |
+| click_rate missing/null | field absent or null | STOP — still required as the tiebreaker; can't safely skip it in case it's needed |
 | zero recipients on either variation | `recipients` stat == 0 | STOP — rates computed from 0 recipients are undefined, not 0% |
 | zero clicks, zero orders (but recipients > 0) | rates legitimately 0.00% | Valid data — proceeds through the algorithm normally (0% is a real value, not missing data) |
-| equal click rates | see algorithm §4 | Falls through to conversion-override-or-STOP path |
-| equal conversion rates | relDiff == 0 | Override never triggers; Click Rate decides (or STOP if that's also tied) |
+| equal conversion rates | see algorithm §4 | Falls through to the click-rate tiebreak |
+| equal click rates too (after a conversion-rate tie) | both metrics tied | STOP — no safe default |
 | API response incomplete / malformed | schema validation failure on the parsed response | STOP, log raw response body (redacting nothing sensitive is in it, but still logged to our own store, never to Slack) |
 | test not yet complete | gate in §2 not satisfied | Do not STOP — this is the normal "not yet time" state; automation simply does nothing this run and checks again next scheduled run |
 | campaign status unexpected | status not in the known-safe enum for its phase | STOP |

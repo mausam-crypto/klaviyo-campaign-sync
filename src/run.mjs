@@ -6,15 +6,28 @@
 // DB is still pending. AUTOMATION_ENABLED defaults to false specifically so this can be deployed
 // and iterated on safely before that first real run.
 import { config } from "./config.mjs";
-import { klaviyoGet } from "./klaviyoClient.mjs";
-// klaviyoPatch is not yet used — the write path is intentionally blocked, see below.
+import { klaviyoGet, klaviyoPatch, klaviyoPost } from "./klaviyoClient.mjs";
 import { lookupPlacedOrderMetricId } from "./metrics.mjs";
 import { fetchVariationStats } from "./reporting.mjs";
 import { classifySnapshot, decideWinner } from "./winner.mjs";
 import { groupCampaignsByFamily, checkFamilyCompleteness } from "./family.mjs";
-import { validateLanguageCampaign } from "./validate.mjs";
+import { validateDualCampaignLanguage } from "./validate.mjs";
 import { findExecution, createOrGetExecution, updateExecution, isCampaignExcluded, recordHeartbeat } from "./db.mjs";
 import { notifySuccess, notifyFailure } from "./slack.mjs";
+
+/**
+ * UNVERIFIED, needs Phase 5 (controlled test campaign) confirmation before this ever runs for
+ * real: what calendar date to target for the "10 AM recipient local time" send. Heuristic below —
+ * same UTC calendar day if there's still enough runway before 10 AM could plausibly have passed
+ * in every timezone, otherwise the next day. Not something to trust without a real dry run.
+ */
+function computeTargetSendDate() {
+  const now = new Date();
+  const cutoffUtcHour = 8; // last hour we'll still target "today" — leaves margin before 10am local anywhere
+  const target = new Date(now);
+  if (now.getUTCHours() >= cutoffUtcHour) target.setUTCDate(target.getUTCDate() + 1);
+  return target.toISOString().slice(0, 10); // "YYYY-MM-DD"
+}
 
 async function listRecentEmailCampaigns() {
   const res = await klaviyoGet(
@@ -133,15 +146,29 @@ async function processFamily(family, conversionMetricId) {
     winner_message_id: winnerMessage.id,
     click_rate_a: statA.clickRate, click_rate_b: statB.clickRate,
     placed_order_rate_a: statA.conversionRate, placed_order_rate_b: statB.conversionRate,
-    conversion_diff_pct: decision.conversionDiffRatio,
-    conversion_override: decision.overrideTriggered,
+    decided_by: decision.decidedBy, // 'conversion_rate' | 'click_rate_tiebreak'
   });
 
-  // Validate every language campaign — all-or-nothing per DESIGN.md §6/§10.
+  if (!family.tagVerified) {
+    // Legacy (name-matched, one-campaign-two-message) families can never reach the write path —
+    // there's no supported API to remove one message from that structure (DESIGN.md §7). Report
+    // and stop rather than guess.
+    await updateExecution(execution.id, { status: "FAILED", failure_reason: "family not tag-verified — refusing write actions on a name-matched, legacy-structure family (DESIGN.md §3/§7)" });
+    await notifyFailure({
+      campaignName: campaignGroupTag,
+      winner: decision.winner,
+      problem: "Family identified by name only (legacy single-campaign structure), not tag-verified dual campaigns",
+      reason: "Write actions only run on dual_campaign families built with group:/lang:/variant: tags. Rebuild this family's language campaigns as two tagged single-message campaigns per language to enable automation.",
+    });
+    return;
+  }
+
+  // Validate every language's TWO campaigns (Variant A / Variant B) — all-or-nothing per
+  // DESIGN.md §6/§10. Only dual_campaign families reach here (gate above).
   const languageResults = [];
-  for (const [lang, campaign] of family.languages) {
-    const result = validateLanguageCampaign({ campaign, messages: campaign._messages, expectedLangCode: lang });
-    languageResults.push({ lang, campaign, result });
+  for (const [lang, slot] of family.languages) {
+    const result = validateDualCampaignLanguage({ campaignA: slot.a, campaignB: slot.b, expectedLangCode: lang });
+    languageResults.push({ lang, slot, result });
   }
   const anyFailed = languageResults.some((r) => !r.result.passed);
   if (anyFailed) {
@@ -156,34 +183,36 @@ async function processFamily(family, conversionMetricId) {
     return;
   }
 
-  if (!family.tagVerified) {
-    await updateExecution(execution.id, { status: "FAILED", failure_reason: "family not tag-verified — refusing write actions on a name-matched family (DESIGN.md §3)" });
-    await notifyFailure({
-      campaignName: campaignGroupTag,
-      winner: decision.winner,
-      problem: "Family identified by name only, not by group:/lang: tags",
-      reason: "Write actions (removing the losing variation, scheduling) are only permitted on tag-verified families. Add group:/lang: tags to this family's campaigns to enable automation.",
-    });
-    return;
-  }
+  // Write path — schedule the winning variant's campaign, archive the losing one. Guarded by
+  // klaviyoClient's dry-run/automation-enabled check; nothing below actually reaches Klaviyo
+  // unless both AUTOMATION_ENABLED=true and DRY_RUN=false. NOT YET RUN FOR REAL — needs Phase 5
+  // (controlled test campaign) before this touches a real send. See computeTargetSendDate()'s
+  // doc comment for the biggest open unknown (exact send-date heuristic).
+  const targetDate = computeTargetSendDate();
+  for (const { lang, slot } of languageResults) {
+    const winnerCampaign = decision.winner === "A" ? slot.a : slot.b;
+    const loserCampaign = decision.winner === "A" ? slot.b : slot.a;
 
-  // WRITE PATH — BLOCKED PENDING A DESIGN DECISION, NOT YET IMPLEMENTED.
-  // Verified against the raw stable OpenAPI spec (2026-09-03): there is no DELETE endpoint for a
-  // single campaign-message, no PATCH/DELETE on the campaign -> campaign-messages relationship,
-  // and POST /api/campaign-clone always clones every message with no subset selection. There is
-  // no documented, stable way to remove one variation from a two-message campaign, even though
-  // that's confirmed to be your team's real manual process today. See DESIGN.md §7 "Variation
-  // selection" for the options put to you (separate single-message campaigns per language,
-  // archived instead of deleted; a manual hybrid; or waiting on the 2026-10-15 beta GA) — this
-  // function must not proceed until that's resolved, so it stops here rather than guessing.
-  await updateExecution(execution.id, { status: "FAILED", failure_reason: "write path not implemented — no supported API removes a losing variation (see DESIGN.md §7)" });
-  await notifyFailure({
-    campaignName: campaignGroupTag,
-    winner: decision.winner,
-    problem: "Winner computed and validated, but the write path is intentionally not implemented yet",
-    reason: "No documented Klaviyo API removes one variation from a two-message campaign — needs a decision, see DESIGN.md §7",
-  });
-  return;
+    await klaviyoPatch(`/campaigns/${winnerCampaign.id}`, {
+      data: {
+        type: "campaign",
+        id: winnerCampaign.id,
+        attributes: {
+          send_strategy: {
+            method: "static",
+            options: { datetime: `${targetDate}T10:00:00`, is_local: true, send_past_recipients_immediately: false },
+          },
+        },
+      },
+    });
+    await klaviyoPost("/campaign-send-jobs", {
+      data: { type: "campaign-send-job", id: winnerCampaign.id },
+    });
+    await klaviyoPatch(`/campaigns/${loserCampaign.id}`, {
+      data: { type: "campaign", id: loserCampaign.id, attributes: { archived: true } },
+    });
+    console.log(`[${campaignGroupTag}] ${lang}: scheduled variant ${decision.winner} (${winnerCampaign.id}), archived the other (${loserCampaign.id})`);
+  }
 
   await updateExecution(execution.id, { status: "SUCCESS" });
   await notifySuccess({
@@ -191,7 +220,7 @@ async function processFamily(family, conversionMetricId) {
     winner: decision.winner,
     clickRateA: statA.clickRate, clickRateB: statB.clickRate,
     placedOrderRateA: statA.conversionRate, placedOrderRateB: statB.conversionRate,
-    overrideTriggered: decision.overrideTriggered,
+    decidedBy: decision.decidedBy,
     languageCount: languageResults.length,
   });
 }

@@ -40,3 +40,19 @@ Ran against the 50 most recent real email campaigns. Findings:
 Family/language matching here uses the name-based fallback (`src/family.mjs`), not the
 tag-based approach recommended in DESIGN.md §3, because no campaign in this account currently has
 any tags set. Risks are documented inline in that file. Revisit once/if tags are adopted.
+
+## 2026-09-03 update: winner rule change + dual-campaign structure
+
+Per your direction, the winner rule is now conversion-rate-primary (Placed Order Rate decides
+outright; Click Rate only breaks an exact tie) — `scripts/phase2` re-run and re-verified above
+reflects this. Both historical fixtures still correctly classify `CONTAMINATED` and are never
+actually decided on in production; the illustrative `decideWinner()` output for them changed
+(now B and A respectively, both via `conversion_rate`) but the safety gate's behavior didn't.
+
+Also per your direction: language campaigns are being restructured from one campaign with two
+messages (today's real shape, confirmed by you) to two separate single-message campaigns per
+language (`variant:a` / `variant:b` tags), since no supported Klaviyo API can remove one message
+from the former. `src/validate.mjs::validateDualCampaignLanguage()` and the corresponding
+`family.mjs` grouping logic are implemented but **not yet run against real data** — no campaign in
+the account uses this structure or these tags yet. `npm run phase3` still only exercises the
+legacy path, since that's all that exists live right now.

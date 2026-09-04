@@ -39,11 +39,7 @@ for (const c of cases) {
   if (decision.stop) {
     console.log(`  decideWinner() result: STOP — ${decision.reason}`);
   } else {
-    console.log(
-      `  decideWinner() result: ${decision.winner} (via ${decision.decidedBy}, ` +
-        `conversion diff ${(decision.conversionDiffRatio * 100).toFixed(1)}%, ` +
-        `override triggered: ${decision.overrideTriggered})`
-    );
+    console.log(`  decideWinner() result: ${decision.winner} (via ${decision.decidedBy})`);
   }
 
   if (classification.classification === "CONTAMINATED") {
@@ -67,18 +63,25 @@ console.log(
 
 const synthetic = [
   {
-    label: "worked example 1 from your spec (B should override on conversion)",
+    label: "higher conversion rate wins outright, even against a lower click rate",
     a: { clickRate: 0.05, conversionRate: 0.01, recipients: 1000 },
     b: { clickRate: 0.048, conversionRate: 0.0115, recipients: 1000 },
     expectWinner: "B",
-    expectDecidedBy: "conversion_override",
+    expectDecidedBy: "conversion_rate",
   },
   {
-    label: "worked example 2 from your spec (A should win on click rate, override below threshold)",
-    a: { clickRate: 0.05, conversionRate: 0.01, recipients: 1000 },
-    b: { clickRate: 0.048, conversionRate: 0.0105, recipients: 1000 },
+    label: "higher conversion rate wins even when click rate favors the other side",
+    a: { clickRate: 0.05, conversionRate: 0.0105, recipients: 1000 },
+    b: { clickRate: 0.048, conversionRate: 0.01, recipients: 1000 },
     expectWinner: "A",
-    expectDecidedBy: "click_rate",
+    expectDecidedBy: "conversion_rate",
+  },
+  {
+    label: "conversion rate tied -> click rate breaks the tie",
+    a: { clickRate: 0.05, conversionRate: 0.01, recipients: 1000 },
+    b: { clickRate: 0.048, conversionRate: 0.01, recipients: 1000 },
+    expectWinner: "A",
+    expectDecidedBy: "click_rate_tiebreak",
   },
   {
     label: "exact tie on everything -> STOP",
