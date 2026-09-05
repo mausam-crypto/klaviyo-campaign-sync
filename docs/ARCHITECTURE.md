@@ -77,39 +77,46 @@ create table campaign_exclusions (
 
 ## Idempotency
 
-**Revised 2026-09-03**: the automation makes zero write calls to Klaviyo (DESIGN.md §7 — no
-supported API can finish the delete+send step, so it stops at a Slack handoff to a human). That
-removes an entire category of risk this section originally had to guard against ("did our send
-call actually land, or did it fail after partially succeeding?" no longer applies) — but the
-handoff and its confirmation still need to be idempotent, since a human acting on a duplicate
-Slack alert, or the automation double-confirming, is still a real failure mode.
+Two structures, two idempotency stories (DESIGN.md §7 has the full history — briefly: no writes,
+then writes were added back once the 28-campaign split was decided on 2026-09-05):
 
+**Legacy structure** (one campaign, two messages per language — read-only reporting only, can
+never reach a write): the handoff and its confirmation still need to be idempotent, since a human
+acting on a duplicate Slack alert, or the automation double-confirming, is a real failure mode.
 - `campaign_group_executions.campaign_group_tag` is unique — before doing anything, the run
-  queries for an existing row for this family. `status = SUCCESS` → skip entirely (already fully
-  confirmed done). `status = AWAITING_MANUAL_ACTION` → skip winner computation and go straight to
-  `verifyManualCompletion()` (below) — the winner, once computed and notified, is never
-  recomputed or re-notified for the same family. `status = FAILED` → does not auto-retry; a human
-  needs to look at `failure_reason`.
+  queries for an existing row for this family. `status = SUCCESS` → skip entirely. `status =
+  AWAITING_MANUAL_ACTION` → skip winner computation and go straight to `verifyManualCompletion()`
+  — the winner, once computed and notified, is never recomputed or re-notified for the same
+  family. `status = FAILED` → does not auto-retry.
 - `language_campaign_results` is keyed `unique (execution_id, language_code)` — the
-  keep/delete-message-id decision for a language is written once (`AWAITING_MANUAL_ACTION`) and
-  from then on only transitions forward to `CONFIRMED_SENT` or `MISMATCH_DETECTED`, never
-  recomputed.
-- **Closing the loop**: every run for a family still in `AWAITING_MANUAL_ACTION` re-fetches its
-  language campaigns and checks each one still pending confirmation: if it now has exactly one
-  message and that message's id matches the recorded `keep_message_id`, mark it
-  `CONFIRMED_SENT`. If it has one message that *doesn't* match, that's a real anomaly (wrong
-  variation sent) — `MISMATCH_DETECTED`, alerted once via `notifyMismatch()`, never silently
-  re-alerted every 5 minutes. Once every language in a family is `CONFIRMED_SENT`, the family
-  flips to `SUCCESS` and `notifyCompletion()` fires.
+  keep/delete-message-id decision for a language is written once and only transitions forward to
+  `CONFIRMED_SENT` or `MISMATCH_DETECTED`, never recomputed.
+- **Closing the loop**: every run for a family still `AWAITING_MANUAL_ACTION` re-fetches its
+  language campaigns: one remaining message matching `keep_message_id` → `CONFIRMED_SENT`; one
+  remaining message that doesn't match → `MISMATCH_DETECTED`, alerted once via `notifyMismatch()`,
+  never re-alerted every 5 minutes. All confirmed → family `SUCCESS`, `notifyCompletion()` fires.
+
+**Dual-campaign structure** (two single-message campaigns per language — the write path): the
+same `campaign_group_executions.campaign_group_tag` uniqueness applies (`SUCCESS` → skip,
+`FAILED` → no auto-retry), but there's no intermediate `AWAITING_MANUAL_ACTION` state — winner
+computation, validation, and the schedule+archive writes all happen in the same run, and the
+family goes straight to `SUCCESS` once they complete. **Writes here are not indiscriminately
+retried** (see below) — a transport error after a write call needs the caller to check the
+campaign's actual resulting state before assuming it didn't land, same principle as the
+now-superseded design originally planned for this, before it was briefly designed out and back in.
 
 ## Retry / rate-limit handling
 
 - Every Klaviyo call goes through one retry wrapper: on `429`, respect `Retry-After` if present,
   else exponential backoff (1s, 2s, 4s, 8s), capped at 4 attempts. On `5xx`, same backoff, capped
-  at 3 attempts. On `4xx` other than 429, no retry — that's a real error (bad request, auth,
-  validation) and retrying won't help. Since every Klaviyo call this project makes is a read
-  (`GET`/`POST` against the Reporting API, which is also read-only despite the verb), a blind
-  retry here is safe by construction — there's no write to accidentally double-apply.
+  at 3 attempts. On `4xx` other than 429, no retry.
+- **Reads** (campaign list, campaign-messages, Reporting API, metrics) are safe to retry blindly —
+  there's no write to double-apply.
+- **Writes** (`dual_campaign`'s schedule/send-job/archive calls) are NOT blindly retried on
+  ambiguous failure. If a write call times out or errors after possibly having reached Klaviyo,
+  re-fetch that campaign's current state first — if it already shows the expected `send_strategy`/
+  `status`/`archived` value, the original call actually succeeded despite the client-side error,
+  and the retry is skipped rather than risking a duplicate schedule/send/archive action.
 - The Reporting API's tight rate limit (1/s, 2/m, 225/day) means: never poll it more often than
   the 5-minute cron interval already provides headroom for, and never call it in a loop across
   many campaigns per run — one call per pending EN family per run, grouped by
@@ -118,11 +125,12 @@ Slack alert, or the automation double-confirming, is still a real failure mode.
 
 ## Dry-run mode
 
-`DRY_RUN=true` env var. Since there's no Klaviyo write path to intercept anymore, this instead
-gates the two side effects that do exist: Slack notifications (logged to console instead of
-posted) and the DB writes that would mark a family `AWAITING_MANUAL_ACTION`/`SUCCESS`/`FAILED`
-for real. Winner computation, validation, and all read calls still execute for real either way,
-so dry-run output reflects genuine analysis of real data — it just doesn't alert anyone or
+`DRY_RUN=true` env var. Klaviyo writes (`dual_campaign`'s schedule/send-job/archive calls) are
+intercepted by `klaviyoClient.mjs`'s write-choke-point, which logs the exact request instead of
+sending it. Slack notifications and DB writes (marking a family `AWAITING_MANUAL_ACTION`/
+`SUCCESS`/`FAILED`) are gated the same way, directly in `slack.mjs`/`db.mjs`. Winner computation,
+validation, and all read calls still execute for real either way, so dry-run output reflects
+genuine analysis of real data — it just doesn't touch Klaviyo, alert anyone, or
 persist state that a later real run would need to respect.
 
 ## Kill switches
@@ -140,9 +148,9 @@ persist state that a later real run would need to respect.
 |---|---|---|---|
 | 1 | Read-only discovery against one real campaign family | No | Produces a discovery report matching real IDs/structure; no unexpected schema surprises vs API_CAPABILITY_MATRIX.md |
 | 2 | Read-only winner calculation | No | Computed winner matches manual calculation from the same Reporting API data, for at least 2 historical completed tests |
-| 3 | Dry-run language matching | No | All 14 languages correctly resolved via tags; validation checklist output matches manual review |
-| 4 | Dry-run full execution | No | End-to-end dry-run output (§23 format) reviewed and approved by you before any write path is enabled |
-| 5 | Test against a controlled/test campaign | Yes, but only a throwaway test campaign you create for this purpose | A real schedule/send round-trips correctly on a campaign nobody but you sees |
+| 3 | Dry-run language matching | No | All 14/28 languages correctly resolved by name; validation checklist output matches manual review |
+| 4 | Dry-run full execution | No | End-to-end dry-run output reviewed and approved by you before any write path is enabled — **done**, confirmed against production Klaviyo + Postgres 2026-09-04 |
+| 5 | Test against a controlled/test campaign | Yes, but only a throwaway test campaign you create for this purpose | A real schedule/send-job/archive round-trips correctly on a campaign nobody but you sees — lower-stakes than originally scoped now that `dual_campaign` campaigns are always single-message (standard Klaviyo behavior), but still worth one real dry run before trusting it on a customer-facing send |
 | 6 | Enable campaign modification, not sending | Yes (PATCH only) | Content/schedule updates land correctly on a real language campaign; still requires you to manually hit "send" |
 | 7 | Controlled real campaign | Yes, full write path, on one real (low-stakes) campaign family, with you watching live | Full automated flow succeeds end-to-end once, matches expected behavior |
 | 8 | Production automation | Yes | Runs unattended on the cron schedule |
@@ -175,7 +183,10 @@ automation self-promotes through.
 - `KLAVIYO_API_KEY` and `SLACK_WEBHOOK_URL` live only in Render's env var store. Never logged —
   the retry/error-logging wrapper explicitly redacts the `Authorization` header and webhook URL
   from any logged request/error object.
-- Minimum scopes only: `campaigns:read`, `metrics:read`, `tags:read`. `campaigns:write` is never
-  requested — the automation makes no write calls to Klaviyo at all (DESIGN.md §7), so there's no
-  phase where it becomes needed.
+- Scopes: `campaigns:read`, `metrics:read`, `campaigns:write` (needed as of 2026-09-05's final
+  design — the 28-campaign split schedules/archives real campaigns; an earlier design briefly had
+  the automation never write to Klaviyo at all, which would have made this permanently
+  unnecessary, but that was reversed — see DESIGN.md §7). `tags:read` is no longer needed since
+  family/language identification is name-based, not tag-based. Klaviyo doesn't allow adding scopes
+  to an existing key, so the original read-only Phase 1 key needs replacing, not editing.
 - `.env` stays gitignored; `.env.example` ships with empty placeholders only.

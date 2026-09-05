@@ -1,101 +1,100 @@
 // Campaign-family / language identification — DESIGN.md §3.
 //
-// RISK, READ BEFORE CHANGING: every campaign in this account currently has empty tags
-// (verified during Phase 1 discovery, 2026-09-03 — 50 most recent campaigns, all `tags: []`).
-// The tag-based approach recommended below (`group:<slug>` + `lang:<code>`) is NOT yet in use, so
-// this module implements the NAME-BASED FALLBACK explicitly as an interim measure, with its risks
-// called out inline rather than silently assumed.
+// Two structures coexist:
+//  - `legacy_single_campaign`: one campaign per language, two messages inside, named
+//    "<subject> (xx)". What every already-sent real campaign in the account looks like. Kept for
+//    read-only reporting only — there is no supported Klaviyo API to remove one message from
+//    this shape (DESIGN.md §7), so it can never reach the write path.
+//  - `dual_campaign` (decided 2026-09-05, after briefly testing and rejecting the alternative):
+//    two single-message campaigns per language, named "<subject> (xx) (a)" / "<subject> (xx) (b)".
+//    This is what your team builds going forward. The write path (src/run.mjs) only ever acts on
+//    this structure — each campaign has exactly one message, so scheduling/sending it is
+//    completely standard, well-documented Klaviyo behavior with no ambiguity about what gets sent.
 //
-// Risks of name-based matching (per your own instruction to document them, not just accept them):
+// RISK, still true for both: every campaign in this account currently has empty tags (verified
+// 2026-09-03), so both structures are identified by name, not by Klaviyo tags. Documented risks:
 // - Two unrelated campaigns could share a subject line (e.g. a re-run of a seasonal email).
 // - A language suffix could be typed inconsistently ("(en)" vs "(EN)" vs "(en-us)").
 // - A subject line retyped slightly differently per language (translation drift) breaks the
-//   "same base name" assumption entirely — there is no guarantee translators keep the base
-//   English string identifiable across all 14 languages.
-//
-// Structure (confirmed by you 2026-09-03, and again 2026-09-03 after briefly exploring a
-// two-campaign-per-language alternative): stays at 14 language campaigns, each with BOTH
-// variation messages inside. Since no Klaviyo API can remove one message or send only one from a
-// two-message campaign, this project's write path stops at computing and reporting the winner —
-// a human deletes the losing message and sends, same manual step as today. See DESIGN.md §7.
+//   "same base name" assumption entirely.
+// Adopting `group:`/`lang:` Klaviyo tags remains the recommended upgrade if this becomes a real
+// problem in practice — not required to start.
 
 const LANGUAGE_SUFFIX = /\s*\(([a-z]{2})\)\s*$/i;
-const GROUP_TAG = /^group:(.+)$/;
-const LANG_TAG = /^lang:([a-z]{2})$/i;
-
-/** Reads a campaign's tag names (already-`include`d tag resources) and pulls out the
- *  `group:<slug>` / `lang:<code>` pair, if present. Returns null if neither tag is set. */
-export function readCampaignTags(tagNames) {
-  let group = null, lang = null;
-  for (const name of tagNames || []) {
-    const g = GROUP_TAG.exec(name);
-    if (g) group = g[1];
-    const l = LANG_TAG.exec(name);
-    if (l) lang = l[1].toLowerCase();
-  }
-  return group || lang ? { group, lang } : null;
-}
+// "<subject> (fr) (a)" / "<subject> (fr) (b)" — two-letter lang code, then a/b, both in their own
+// parens, at the very end. Deliberately requires BOTH parts so a plain "<subject> (fr)" (legacy)
+// never matches this and vice versa.
+const VARIANT_SUFFIX = /\s*\(([a-z]{2})\)\s*\(([ab])\)\s*$/i;
 
 /** Splits "Some subject (fr)" into { baseName: "Some subject", langCode: "fr" }. Returns null if
- *  the name doesn't end in a recognized "(xx)" language suffix. */
+ *  the name doesn't end in a recognized "(xx)" language suffix (including if it's actually a
+ *  "(xx) (a/b)" variant name — VARIANT_SUFFIX's extra "(a|b)" isn't a valid 2-letter lang code,
+ *  so this pattern doesn't accidentally match those). */
 export function parseCampaignName(name) {
   const match = LANGUAGE_SUFFIX.exec(name || "");
   if (!match) return null;
-  return {
-    baseName: name.slice(0, match.index).trim(),
-    langCode: match[1].toLowerCase(),
-  };
+  return { baseName: name.slice(0, match.index).trim(), langCode: match[1].toLowerCase() };
+}
+
+/** Splits "Some subject (fr) (a)" into { baseName: "Some subject", langCode: "fr", variant: "a" }.
+ *  Returns null if the name doesn't end in the two-part "(xx) (a|b)" suffix. */
+export function parseVariantCampaignName(name) {
+  const match = VARIANT_SUFFIX.exec(name || "");
+  if (!match) return null;
+  return { baseName: name.slice(0, match.index).trim(), langCode: match[1].toLowerCase(), variant: match[2].toLowerCase() };
 }
 
 /**
- * Groups a flat campaign list into families. Prefers the tag-based `group:`/`lang:` convention
- * when a campaign carries those tags (`tagVerified: true`) — recommended because it's
- * deterministic, but the stakes of getting it wrong are lower now than under the earlier
- * write-capable design: a misidentified family here leads to a wrong *notification* to a human,
- * not an unattended send or delete. Still worth getting right, since a human might act on it
- * without double-checking. Everything else falls back to name matching (`tagVerified: false`).
- * A tag-based family and a name-based family are never merged.
- *
- * Expects each campaign object to carry `_tagNames` (array of this campaign's tag name strings,
- * populated by the caller from the `tags` include) alongside the usual `attributes.name`.
+ * Groups a flat campaign list into families, keyed by base subject name. Each family ends up
+ * `structure: "dual_campaign"` (any of its language entries matched the "(xx) (a/b)" pattern) or
+ * `"legacy_single_campaign"` (matched the plain "(xx)" pattern instead) — a family mixing both
+ * within the same base name is flagged as a conflict, not silently resolved either way.
+ * `family.languages.get(lang)` is `{ a, b }` under `dual_campaign`, or the campaign object
+ * directly under `legacy_single_campaign`.
  */
 export function groupCampaignsByFamily(campaigns) {
-  const families = new Map(); // key -> { en, languages: Map<langCode, campaign>, tagVerified }
+  const families = new Map();
+
+  const ensureFamily = (baseName) => {
+    const key = `name:${baseName}`;
+    if (!families.has(key)) {
+      families.set(key, { baseName, en: null, languages: new Map(), structure: null });
+    }
+    return families.get(key);
+  };
 
   for (const c of campaigns) {
-    const tagInfo = readCampaignTags(c._tagNames);
-    const nameInfo = parseCampaignName(c.attributes?.name);
+    const variantInfo = parseVariantCampaignName(c.attributes?.name);
+    const singleInfo = variantInfo ? null : parseCampaignName(c.attributes?.name);
+    if (!variantInfo && !singleInfo) continue; // no recognizable suffix — not in scope
 
-    let key, langCode, tagVerified;
-    if (tagInfo?.group) {
-      key = `tag:${tagInfo.group}`;
-      langCode = (tagInfo.lang || nameInfo?.langCode || "").toLowerCase();
-      tagVerified = true;
-      if (tagInfo.lang && nameInfo && tagInfo.lang !== nameInfo.langCode) {
-        c._tagNameLangMismatch = true; // lang: tag disagrees with the "(xx)" name suffix
-      }
-    } else if (nameInfo) {
-      key = `name:${nameInfo.baseName}`;
-      langCode = nameInfo.langCode;
-      tagVerified = false;
-    } else {
-      continue; // neither a group tag nor a recognizable "(xx)" suffix — not in scope
-    }
+    if (variantInfo) {
+      const family = ensureFamily(variantInfo.baseName);
+      if (family.structure === "legacy_single_campaign") family.structureConflict = true;
+      family.structure = family.structure || "dual_campaign";
 
-    if (!families.has(key)) {
-      families.set(key, { baseName: nameInfo?.baseName || tagInfo?.group, en: null, languages: new Map(), tagVerified });
-    }
-    const family = families.get(key);
-
-    if (langCode === "en") {
-      if (family.en) family.enConflict = true;
-      family.en = c;
-    } else {
-      if (family.languages.has(langCode)) {
+      const slot = family.languages.get(variantInfo.langCode) || { a: null, b: null };
+      if (slot[variantInfo.variant]) {
         family.languageConflicts = family.languageConflicts || [];
-        family.languageConflicts.push(langCode);
+        family.languageConflicts.push(`${variantInfo.langCode}:${variantInfo.variant}`);
       }
-      family.languages.set(langCode, c);
+      slot[variantInfo.variant] = c;
+      family.languages.set(variantInfo.langCode, slot);
+    } else {
+      const family = ensureFamily(singleInfo.baseName);
+      if (singleInfo.langCode === "en") {
+        if (family.en) family.enConflict = true;
+        family.en = c;
+        continue;
+      }
+      if (family.structure === "dual_campaign") family.structureConflict = true;
+      family.structure = family.structure || "legacy_single_campaign";
+
+      if (family.languages.has(singleInfo.langCode)) {
+        family.languageConflicts = family.languageConflicts || [];
+        family.languageConflicts.push(singleInfo.langCode);
+      }
+      family.languages.set(singleInfo.langCode, c);
     }
   }
 
@@ -107,15 +106,23 @@ export const EXPECTED_LANGUAGES = [
 ];
 
 /** Cross-checks a matched family against the expected 14-language roster. Never silently
- *  proceeds with a partial set — DESIGN.md §10 requires all 14 to independently pass. */
+ *  proceeds with a partial set — DESIGN.md §10 requires all 14 to independently pass. Under
+ *  `dual_campaign`, a language only counts as present if BOTH its `a` and `b` campaigns exist. */
 export function checkFamilyCompleteness(family) {
-  const missing = EXPECTED_LANGUAGES.filter((lang) => !family.languages.has(lang));
+  const isDual = family.structure === "dual_campaign";
+  const languagePresent = (lang) => {
+    const entry = family.languages.get(lang);
+    if (!entry) return false;
+    return isDual ? !!(entry.a && entry.b) : true;
+  };
+  const missing = EXPECTED_LANGUAGES.filter((lang) => !languagePresent(lang));
   const unexpected = [...family.languages.keys()].filter((lang) => !EXPECTED_LANGUAGES.includes(lang));
   return {
-    complete: missing.length === 0 && !family.enConflict && !family.languageConflicts,
+    complete: missing.length === 0 && !family.enConflict && !family.languageConflicts && !family.structureConflict,
     missing,
     unexpected,
     enConflict: !!family.enConflict,
     languageConflicts: family.languageConflicts || [],
+    structureConflict: !!family.structureConflict,
   };
 }

@@ -11,17 +11,33 @@
 // via Slack with the exact message to delete and campaign to send, per language. A later run
 // verifies the human's action landed correctly before marking the family SUCCESS.
 import { config } from "./config.mjs";
-import { klaviyoGet } from "./klaviyoClient.mjs";
+import { klaviyoGet, klaviyoPatch, klaviyoPost } from "./klaviyoClient.mjs";
 import { lookupPlacedOrderMetricId } from "./metrics.mjs";
 import { fetchVariationStats } from "./reporting.mjs";
 import { classifySnapshot, decideWinner } from "./winner.mjs";
 import { groupCampaignsByFamily, checkFamilyCompleteness } from "./family.mjs";
-import { validateLanguageCampaign, identifyVariationMessages } from "./validate.mjs";
+import { validateLanguageCampaign, identifyVariationMessages, validateDualCampaignLanguage } from "./validate.mjs";
 import {
   findExecution, createOrGetExecution, updateExecution, isCampaignExcluded, recordHeartbeat,
   upsertLanguageResult, getLanguageResults, confirmLanguageResult,
 } from "./db.mjs";
-import { notifyWinnerReady, notifyCompletion, notifyMismatch, notifyFailure } from "./slack.mjs";
+import { notifyWinnerReady, notifyCompletion, notifyMismatch, notifyFailure, notifyAutomatedSuccess } from "./slack.mjs";
+
+/**
+ * Only reached for `dual_campaign` families — each campaign here has exactly one message, so
+ * scheduling/sending it is standard, well-documented Klaviyo behavior with no ambiguity about
+ * what actually gets sent (unlike the legacy structure, where this was the whole blocker).
+ * UNVERIFIED heuristic for which calendar date to target though: same UTC day if there's still
+ * runway before 10 AM could plausibly have passed in every timezone, otherwise the next day.
+ * Worth confirming against a real run before fully trusting it.
+ */
+function computeTargetSendDate() {
+  const now = new Date();
+  const cutoffUtcHour = 8; // last hour we'll still target "today" — leaves margin before 10am local anywhere
+  const target = new Date(now);
+  if (now.getUTCHours() >= cutoffUtcHour) target.setUTCDate(target.getUTCDate() + 1);
+  return target.toISOString().slice(0, 10); // "YYYY-MM-DD"
+}
 
 async function listRecentEmailCampaigns() {
   const res = await klaviyoGet(
@@ -187,7 +203,16 @@ async function processFamily(family, conversionMetricId) {
     decided_by: decision.decidedBy,
   });
 
-  // Validate every language campaign — all-or-nothing per DESIGN.md §6/§10.
+  if (family.structure === "dual_campaign") {
+    await processDualCampaignFamily({ family, campaignGroupTag, execution, decision, statA, statB });
+  } else {
+    await processLegacyFamily({ family, campaignGroupTag, execution, decision, statA, statB });
+  }
+}
+
+/** Legacy structure (one campaign, two messages per language): validates, then hands off to a
+ *  human via Slack — see module header for why this can never write to Klaviyo. */
+async function processLegacyFamily({ family, campaignGroupTag, execution, decision, statA, statB }) {
   const languageResults = [];
   for (const [lang, campaign] of family.languages) {
     const result = validateLanguageCampaign({ campaign, messages: campaign._messages, expectedLangCode: lang });
@@ -234,6 +259,66 @@ async function processFamily(family, conversionMetricId) {
     placedOrderRateA: statA.conversionRate, placedOrderRateB: statB.conversionRate,
     decidedBy: decision.decidedBy,
     languageResults: notifyRows,
+  });
+}
+
+/** Dual-campaign structure (two single-message campaigns per language, decided 2026-09-05): the
+ *  automation finishes the job itself — schedules the winner, archives the loser. Each write goes
+ *  through klaviyoClient's dry-run/automation-enabled guard; nothing below reaches Klaviyo unless
+ *  both AUTOMATION_ENABLED=true and DRY_RUN=false. */
+async function processDualCampaignFamily({ family, campaignGroupTag, execution, decision, statA, statB }) {
+  const languageResults = [];
+  for (const [lang, slot] of family.languages) {
+    const result = validateDualCampaignLanguage({ campaignA: slot.a, campaignB: slot.b, expectedLangCode: lang });
+    languageResults.push({ lang, slot, result });
+  }
+  const anyFailed = languageResults.some((r) => !r.result.passed);
+  if (anyFailed) {
+    const failedLangs = languageResults.filter((r) => !r.result.passed).map((r) => r.lang);
+    await updateExecution(execution.id, { status: "FAILED", failure_reason: `validation failed for: ${failedLangs.join(", ")}` });
+    await notifyFailure({
+      campaignName: campaignGroupTag,
+      winner: decision.winner,
+      problem: `${failedLangs.join(", ")} campaign(s) could not be validated`,
+      reason: languageResults.find((r) => !r.result.passed).result.failures[0]?.detail,
+    });
+    return;
+  }
+
+  const targetDate = computeTargetSendDate();
+  for (const { lang, slot } of languageResults) {
+    const winnerCampaign = decision.winner === "A" ? slot.a : slot.b;
+    const loserCampaign = decision.winner === "A" ? slot.b : slot.a;
+
+    await klaviyoPatch(`/campaigns/${winnerCampaign.id}`, {
+      data: {
+        type: "campaign",
+        id: winnerCampaign.id,
+        attributes: {
+          send_strategy: {
+            method: "static",
+            options: { datetime: `${targetDate}T10:00:00`, is_local: true, send_past_recipients_immediately: false },
+          },
+        },
+      },
+    });
+    await klaviyoPost("/campaign-send-jobs", {
+      data: { type: "campaign-send-job", id: winnerCampaign.id },
+    });
+    await klaviyoPatch(`/campaigns/${loserCampaign.id}`, {
+      data: { type: "campaign", id: loserCampaign.id, attributes: { archived: true } },
+    });
+    console.log(`[${campaignGroupTag}] ${lang}: scheduled variant ${decision.winner} (${winnerCampaign.id}), archived the other (${loserCampaign.id})`);
+  }
+
+  await updateExecution(execution.id, { status: "SUCCESS" });
+  await notifyAutomatedSuccess({
+    campaignName: campaignGroupTag,
+    winner: decision.winner,
+    clickRateA: statA.clickRate, clickRateB: statB.clickRate,
+    placedOrderRateA: statA.conversionRate, placedOrderRateB: statB.conversionRate,
+    decidedBy: decision.decidedBy,
+    languageCount: languageResults.length,
   });
 }
 

@@ -2,10 +2,11 @@
 
 Automates what happens after Cellexia's EN Klaviyo campaign's native A/B test concludes: computes
 an independent winner (Placed Order Rate is the primary metric, Click Rate only breaks an exact
-tie), validates the 14 language-campaign drafts, and tells a human exactly which message to
-delete and which campaign to send — no Klaviyo API can finish that last step itself (see
-docs/DESIGN.md §7), so the automation stops at a Slack handoff and later verifies it was done
-correctly.
+tie), validates the 28 language campaigns (two single-message campaigns per language, `"<subject>
+(xx) (a)"` / `"(b)"`), then schedules the winner and archives the loser itself. An earlier design
+(14 campaigns, both variations in one) had no supported way to finish that step automatically and
+stopped at a Slack handoff instead — kept in the codebase for read-only reporting on old-style
+campaigns, see docs/DESIGN.md §7 for the full history.
 
 **Read [docs/DESIGN.md](docs/DESIGN.md) first.** It documents the business logic, the Klaviyo API
 behavior this depends on (some of it verified against real account data, not just docs — see
@@ -15,12 +16,13 @@ detectable) and how this project works around it.
 
 ## Status
 
-Phases 1–3 of the rollout plan (docs/ARCHITECTURE.md) are built and validated against live,
-real Klaviyo data (read-only). Phase 4+ (Postgres-backed idempotency, the Slack handoff, and its
-completion-verification pass) is implemented but **not yet live-tested** — Postgres isn't
-provisioned yet. Slack webhook is configured. The automation makes zero write calls to Klaviyo by
-design (see docs/DESIGN.md §7) — its only real-world effects are a Slack message and its own
-database records.
+Phases 1–3 (docs/ARCHITECTURE.md) are built and validated against live, real Klaviyo data
+(read-only). Phase 4 (Postgres-backed idempotency) is deployed on Render and confirmed working
+against production — DB connectivity, Klaviyo connectivity, and the completion-verification logic
+have all been tested against real data. **The write path for the current (dual-campaign) design
+has not been run for real yet** — no campaign in the account uses the `(xx) (a)`/`(xx) (b)`
+naming convention as of this writing, and the current Klaviyo API key is read-only (needs
+`campaigns:write` added via a replacement key before this can schedule/archive anything for real).
 
 ## Setup
 

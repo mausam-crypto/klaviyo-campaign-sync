@@ -47,6 +47,30 @@ export async function notifyWinnerReady({ campaignName, winner, clickRateA, clic
   );
 }
 
+/**
+ * Dual-campaign structure only (DESIGN.md §7, decided 2026-09-05): the automation itself
+ * scheduled the winning single-message campaign and archived the losing one for every language —
+ * no human action needed. Distinct from notifyCompletion, which confirms a *human's* manual
+ * action under the legacy structure.
+ */
+export async function notifyAutomatedSuccess({ campaignName, winner, clickRateA, clickRateB, placedOrderRateA, placedOrderRateB, decidedBy, languageCount }) {
+  const pct = (n) => `${(n * 100).toFixed(2)}%`;
+  const decidedByText = decidedBy === "click_rate_tiebreak"
+    ? "Click Rate (conversion rates were exactly tied)"
+    : "Placed Order Rate (conversion) — the primary metric";
+  await post(
+    `:white_check_mark: *Klaviyo Campaign Automation Completed*\n\n` +
+      `*Campaign:* ${campaignName}\n` +
+      `*Winner:* Variation ${winner}\n` +
+      `*Decided by:* ${decidedByText}\n\n` +
+      `*Placed Order Rate:* A = ${pct(placedOrderRateA)}, B = ${pct(placedOrderRateB)}\n` +
+      `*Click Rate:* A = ${pct(clickRateA)}, B = ${pct(clickRateB)}\n\n` +
+      `${languageCount} language campaigns scheduled for 10:00 AM recipient local time, losing ` +
+      `variant archived in each. No action needed.\n\n` +
+      `*Status:* SUCCESS`
+  );
+}
+
 /** Sent once a prior notifyWinnerReady's languages are all confirmed sent (src/run.mjs's
  *  verification pass) — closes the loop so the audit trail shows the family actually finished. */
 export async function notifyCompletion({ campaignName, winner, languageCount }) {

@@ -120,24 +120,20 @@ The `"(xx)"` name suffix becomes a **secondary cross-check only**: if a campaign
 language disagrees with its `lang:` tag, that's a validation failure (STOP), not something the
 automation silently resolves.
 
-**Decision (2026-09-03): implemented as designed above, at your direction.** `src/family.mjs`
-now does both, and treats them as different trust levels rather than blending them:
+**Superseded (2026-09-03 → 2026-09-05).** The tag approach was implemented briefly, then dropped
+in favor of a name-based convention when §7's final decision (28-campaign split) settled on your
+own naming scheme instead: `"<subject> (xx) (a)"` / `"<subject> (xx) (b)"` per language, `"<subject>
+(en)"` unchanged for EN. `src/family.mjs` now identifies structure purely from these two suffix
+shapes — no tags involved. This also means the stakes discussion below is reversed from an
+earlier draft of this section: since §7's final decision has the automation actually schedule and
+archive real campaigns for `dual_campaign` families (not just notify), getting family/language
+identification right matters at full stakes again, not reduced ones. The documented risks of
+name-based matching (translation drift, inconsistent suffix casing, etc.) still apply — worth
+keeping in mind if this ever causes a real mismatch, at which point Klaviyo tags remain available
+as a more robust upgrade.
 
-- A campaign carrying a `group:<slug>` tag is grouped by that tag (`lang:<code>` giving its
-  language, cross-checked against the `(xx)` name suffix — a mismatch is flagged, not silently
-  resolved). That family is marked `tagVerified: true`.
-- Everything else falls back to name matching, marked `tagVerified: false`.
-
-Note the stakes here changed after §7's write-path decision below: since the automation never
-deletes or sends anything itself (it hands off to a human via Slack), a misidentified
-name-matched family leads to a wrong *notification*, not an unattended destructive action. Still
-worth getting right — a human could act on a wrong notification without double-checking — so
-`tagVerified` is tracked and worth adopting, just no longer the hard gate it would have been
-under the rejected write-capable design.
-
-No tags exist in the account yet. Name-based matching (documented risks above) is what every
-family the automation sees will use until your team starts adding `group:`/`lang:` tags — that's
-the current normal state, not a bug to fix.
+The legacy single-suffix pattern (`"(xx)"` alone, no `(a/b)`) still identifies old-style families
+for read-only reporting — see §7.
 
 ---
 
@@ -277,33 +273,44 @@ two-message campaign.** Whatever your team's manual delete action in the Klaviyo
 calls, it isn't part of the public API surface this project is restricted to (per your own rule
 against undocumented endpoints) — so the automation cannot literally replicate that click today.
 
-Three ways forward were put to you. A fourth option (restructuring into two single-message
-campaigns per language, letting the automation schedule/archive within the supported API) was
-tried and explicitly rejected on 2026-09-03 — you want to stay at 14 language campaigns, both
-variations in one. Also confirmed: `POST /api/campaign-send-jobs` only takes a campaign `id`, no
-message selection, and there's no "primary message" concept on the campaign resource either — so
-sending a two-message campaign as-is would send both to the same list. Combined with no delete
-capability, there's no way for the automation to safely finish this step itself while keeping the
-14-campaign structure.
+**This whole question went through three rounds before landing.**
 
-**Decision (2026-09-03): Option 2 — the automation stops at winner detection.** It computes the
-winner, validates all 14 language campaigns, and identifies (via `identifyVariationMessages()`,
-label-based, DESIGN.md §8) exactly which message to keep and which to delete per language — then
-hands off to a human via Slack (`notifyWinnerReady()`) with that exact list, rather than guessing
-or attempting an unsupported write. A human deletes the losing message and sends, same manual
-click as today, just with the winner already decided and double-checked.
+1. (2026-09-03) Considered restructuring into two single-message campaigns per language, letting
+   the automation schedule/archive within the supported API — rejected the same day, wanting to
+   stay at 14 language campaigns.
+2. (2026-09-03) With 14 campaigns confirmed as the constraint, and `POST /api/campaign-send-jobs`
+   confirmed to have no message-selection field and no "primary message" concept either, decided
+   the automation stops at winner detection and hands off to a human (`notifyWinnerReady()` +
+   `verifyManualCompletion()`) — implemented, tested against real data, deployed to production.
+3. **(2026-09-05, final) Reopened and reversed**: you asked whether the automation could send the
+   winner itself. Re-examining the tradeoff: the 28-campaign split isn't just "the only API-clean
+   option" — it also completely removes the *technical* risk that made option 1 unappealing,
+   because every campaign under that structure has exactly one message. There's no "does sending
+   a two-message campaign deliver both variants" question to even worry about; scheduling and
+   sending a single-message campaign is Klaviyo's ordinary, fully-documented behavior. **Decided:
+   go with the 28-campaign split after all**, named `"<subject> (xx) (a)"` / `"<subject> (xx)
+   (b)"` per language (your exact convention) — the automation now finishes the job itself:
+   schedules the winning campaign, archives the losing one (`archived: true` — reversible, not a
+   delete), no human step required.
 
-**Closing the loop**: the automation doesn't just fire the notification and forget. On each
-subsequent run, `verifyManualCompletion()` re-checks every language campaign that's still
-`AWAITING_MANUAL_ACTION`: if it now has exactly one message and that message's id matches the
-computed winner, it's marked `CONFIRMED_SENT`; once every language in a family is confirmed, the
-family flips to `SUCCESS` and a completion notification fires. If a campaign ends up with one
-message that does *not* match the winner — someone deleted the wrong one — that's a
-`notifyMismatch()` alert, once, not a silent miss.
+**Naming/identification, final**: name-based (matching your chosen convention), not tags — see
+`src/family.mjs`. A family is `dual_campaign` structure if its language entries end in `(xx) (a)`/
+`(xx) (b)`; `legacy_single_campaign` if they end in a plain `(xx)` (every already-sent real
+campaign looks like this, kept for read-only reporting only, since it's structurally incapable of
+ever reaching the write path). The two never mix within one family without being flagged as a
+conflict.
 
-Option 3 (wait for the omnichannel Campaigns API, `.pre` beta, GA not before 2026-10-15) remains
-a real future path if a proper "delete a variation" capability lands there — worth revisiting
-then, not now, per your own rule against beta functionality in production.
+**Consequence for the API key**: this write path needs `campaigns:write` — `PATCH
+/api/campaigns/{id}` (set schedule) and `{id}`/`archived` (archive the loser), plus
+`POST /api/campaign-send-jobs` (send). The key created for Phase 1 discovery was deliberately
+read-only (`campaigns:read`, `metrics:read`, `tags:read`) and Klaviyo doesn't allow adding scopes
+to an existing key — a new key (or a scope-expanded replacement) is needed before this can run for
+real. §11's earlier note that `campaigns:write` would "never" be needed no longer holds after this
+reversal.
+
+The legacy handoff flow (`notifyWinnerReady()`/`verifyManualCompletion()`) stays in the codebase
+for any family still using the old structure — it just won't be exercised for new sends once your
+team builds language campaigns the new way.
 
 ---
 
@@ -357,11 +364,14 @@ Split into companion documents to keep this one readable:
 
 ## 11. Open decisions before Phase 1 (live discovery) can start
 
-**All resolved as of 2026-09-03** (kept below as a record of what was asked). One update worth
-flagging: since §7's final decision means the automation never writes to Klaviyo at all, the
-`campaigns:write` scope mentioned in point 1 below is never needed, permanently — not just
-deferred to a later phase. The API key can stay read-only (`campaigns:read`, `metrics:read`,
-`tags:read`) for the life of this project.
+**All resolved as of 2026-09-03** (kept below as a record of what was asked). **Superseded
+2026-09-05**: §7 originally settled on a design where the automation never writes to Klaviyo,
+making the `campaigns:write` scope in point 1 permanently unnecessary — that held for two days,
+then §7 was reopened and reversed. The final design (28-campaign split) *does* write to Klaviyo
+(schedule the winner, archive the loser), so `campaigns:write` is needed after all. Klaviyo
+doesn't allow adding scopes to an existing key, so the original read-only key from Phase 1
+discovery needs to be replaced with one that includes `campaigns:write` before this can run for
+real.
 
 
 1. **Klaviyo private API key** — create one scoped to (initially, read-only):
