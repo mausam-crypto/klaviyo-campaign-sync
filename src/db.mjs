@@ -11,7 +11,11 @@ let pool;
 export function getPool() {
   if (!pool) {
     if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL not set");
-    pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+    // Render Postgres requires SSL for external connections (internal Render-network connections
+    // tolerate it too) — without this, connecting from outside Render's network resets the
+    // connection. rejectUnauthorized:false matches Render's self-signed setup, same as
+    // scripts/migrate.mjs.
+    pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
   }
   return pool;
 }
