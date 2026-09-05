@@ -20,6 +20,8 @@
 // Adopting `group:`/`lang:` Klaviyo tags remains the recommended upgrade if this becomes a real
 // problem in practice — not required to start.
 
+import { config } from "./config.mjs";
+
 const LANGUAGE_SUFFIX = /\s*\(([a-z]{2})\)\s*$/i;
 // "<subject> (fr) (a)" / "<subject> (fr) (b)" — two-letter lang code, then a/b, both in their own
 // parens, at the very end. Deliberately requires BOTH parts so a plain "<subject> (fr)" (legacy)
@@ -101,22 +103,25 @@ export function groupCampaignsByFamily(campaigns) {
   return families;
 }
 
-export const EXPECTED_LANGUAGES = [
-  "fr", "de", "da", "sv", "fi", "nl", "it", "es", "pl", "pt", "no", "ro", "hu", "el",
-];
+/** Full language roster by default; overridable (config.expectedLanguages, `EXPECTED_LANGUAGES`
+ *  env var) for a smaller controlled test — see src/config.mjs. */
+export function getExpectedLanguages() {
+  return config.expectedLanguages;
+}
 
-/** Cross-checks a matched family against the expected 14-language roster. Never silently
- *  proceeds with a partial set — DESIGN.md §10 requires all 14 to independently pass. Under
+/** Cross-checks a matched family against the expected language roster. Never silently proceeds
+ *  with a partial set — DESIGN.md §10 requires all of them to independently pass. Under
  *  `dual_campaign`, a language only counts as present if BOTH its `a` and `b` campaigns exist. */
 export function checkFamilyCompleteness(family) {
+  const expected = getExpectedLanguages();
   const isDual = family.structure === "dual_campaign";
   const languagePresent = (lang) => {
     const entry = family.languages.get(lang);
     if (!entry) return false;
     return isDual ? !!(entry.a && entry.b) : true;
   };
-  const missing = EXPECTED_LANGUAGES.filter((lang) => !languagePresent(lang));
-  const unexpected = [...family.languages.keys()].filter((lang) => !EXPECTED_LANGUAGES.includes(lang));
+  const missing = expected.filter((lang) => !languagePresent(lang));
+  const unexpected = [...family.languages.keys()].filter((lang) => !expected.includes(lang));
   return {
     complete: missing.length === 0 && !family.enConflict && !family.languageConflicts && !family.structureConflict,
     missing,

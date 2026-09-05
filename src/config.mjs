@@ -33,6 +33,15 @@ export const config = {
   pollWindowStartFactor: num(process.env.POLL_WINDOW_START_FACTOR, 0.5),
   pollWindowEndFactor: num(process.env.POLL_WINDOW_END_FACTOR, 1.5),
 
+  // Full 14-language roster by default; override for a smaller controlled test (e.g.
+  // EXPECTED_LANGUAGES=fr) so Phase 5 doesn't require building all 28 real language campaigns
+  // just to exercise the real code path once. Reset to the full list before relying on this for
+  // real production sends — a narrowed list here is exactly as unsafe in production as it is
+  // useful in a deliberate test.
+  expectedLanguages: (process.env.EXPECTED_LANGUAGES
+    ? process.env.EXPECTED_LANGUAGES.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+    : ["fr", "de", "da", "sv", "fi", "nl", "it", "es", "pl", "pt", "no", "ro", "hu", "el"]),
+
   slackWebhookUrl: process.env.SLACK_WEBHOOK_URL,
   automationVersion: "0.1.0",
 };
