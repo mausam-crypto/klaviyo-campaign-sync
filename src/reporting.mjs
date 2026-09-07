@@ -1,4 +1,4 @@
-import { klaviyoPost } from "./klaviyoClient.mjs";
+import { klaviyoQuery } from "./klaviyoClient.mjs";
 
 /**
  * Per-variation click/conversion stats for one campaign. The group_by combination below was
@@ -13,7 +13,7 @@ import { klaviyoPost } from "./klaviyoClient.mjs";
  * spacing; see ARCHITECTURE.md's cron cadence notes.
  */
 export async function fetchVariationStats(campaignId, conversionMetricId, timeframe) {
-  const res = await klaviyoPost("/campaign-values-reports", {
+  const res = await klaviyoQuery("/campaign-values-reports", {
     data: {
       type: "campaign-values-report",
       attributes: {
