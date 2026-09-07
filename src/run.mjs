@@ -163,7 +163,16 @@ async function processFamily(family, conversionMetricId) {
     await notifyFailure({ campaignName: campaignGroupTag, problem: "EN campaign does not have exactly 2 variations" });
     return;
   }
-  const [msgA, msgB] = enMessages;
+  // Identify by label ("... Variation A" / "... Variation B"), same signal used for language
+  // campaigns (DESIGN.md §8) — NOT array order. Found via a controlled test (2026-09-07) where
+  // this had silently trusted array order instead; real EN campaigns in this account do carry
+  // proper Variation A/B labels, so this hadn't bitten anything yet, but nothing was verifying it.
+  const { messageA: msgA, messageB: msgB } = identifyVariationMessages(enMessages);
+  if (!msgA || !msgB) {
+    await updateExecution(execution.id, { status: "FAILED", failure_reason: `could not identify EN "Variation A"/"Variation B" by label among: ${enMessages.map((m) => JSON.stringify(m.attributes?.definition?.label)).join(", ")}` });
+    await notifyFailure({ campaignName: campaignGroupTag, problem: "EN campaign-messages don't carry identifiable Variation A/B labels" });
+    return;
+  }
   const statA = stats.find((s) => s.campaignMessageId === msgA.id);
   const statB = stats.find((s) => s.campaignMessageId === msgB.id);
 
