@@ -65,8 +65,9 @@ export async function notifyAutomatedSuccess({ campaignName, winner, clickRateA,
       `*Decided by:* ${decidedByText}\n\n` +
       `*Placed Order Rate:* A = ${pct(placedOrderRateA)}, B = ${pct(placedOrderRateB)}\n` +
       `*Click Rate:* A = ${pct(clickRateA)}, B = ${pct(clickRateB)}\n\n` +
-      `${languageCount} language campaigns scheduled for 10:00 AM recipient local time, losing ` +
-      `variant archived in each. No action needed.\n\n` +
+      `${languageCount} language campaigns scheduled for 10:00 AM recipient local time. The ` +
+      `losing variant's campaign is left as an un-sent Draft (Klaviyo's API doesn't support ` +
+      `archiving) — safe to ignore, or delete manually later. No action needed.\n\n` +
       `*Status:* SUCCESS`
   );
 }

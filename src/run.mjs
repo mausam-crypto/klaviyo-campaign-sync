@@ -1,15 +1,16 @@
 // Main cron entry point (`npm run run`, invoked every 5 minutes by the Render Cron Job).
+// AUTOMATION_ENABLED defaults to false so this can be deployed and iterated on safely.
 //
-// NOT YET LIVE-TESTED end-to-end — depends on a provisioned Postgres (DATABASE_URL) which does
-// not exist yet as of this writing. AUTOMATION_ENABLED defaults to false specifically so this can
-// be deployed and iterated on safely before that first real run.
-//
-// Write path (2026-09-03, confirmed with you): the automation does NOT delete a message, archive
-// a campaign, or send anything. No Klaviyo API can remove one message from a two-message campaign
-// or send only one of its messages (verified against the raw stable OpenAPI spec — see
-// DESIGN.md §7). So this stops at computing and validating the winner, then hands off to a human
-// via Slack with the exact message to delete and campaign to send, per language. A later run
-// verifies the human's action landed correctly before marking the family SUCCESS.
+// Two structures, two write paths (DESIGN.md §7 has the full back-and-forth history):
+// - `dual_campaign` (current, for new sends): two single-message campaigns per language, named
+//   "<subject> (xx) (a)"/"(b)". The automation schedules the winning campaign for real (verified
+//   end-to-end against a real controlled test 2026-09-07, including catching and fixing two real
+//   API schema bugs and a missing write-verification gap). The losing campaign is simply left as
+//   an un-sent Draft — Klaviyo's API has no way to archive a campaign, but an un-sent Draft is
+//   already 100% safe, so nothing further is needed.
+// - `legacy_single_campaign` (old real sends only): one campaign, two messages, no supported API
+//   can isolate one message to send — this path only ever computes/validates and hands off to a
+//   human via Slack, never writes to Klaviyo.
 import { config } from "./config.mjs";
 import { klaviyoGet, klaviyoPatch, klaviyoPost } from "./klaviyoClient.mjs";
 import { lookupPlacedOrderMetricId } from "./metrics.mjs";
@@ -271,10 +272,26 @@ async function processLegacyFamily({ family, campaignGroupTag, execution, decisi
   });
 }
 
-/** Dual-campaign structure (two single-message campaigns per language, decided 2026-09-05): the
- *  automation finishes the job itself — schedules the winner, archives the loser. Each write goes
- *  through klaviyoClient's dry-run/automation-enabled guard; nothing below reaches Klaviyo unless
- *  both AUTOMATION_ENABLED=true and DRY_RUN=false. */
+/**
+ * Dual-campaign structure (two single-message campaigns per language, decided 2026-09-05): the
+ * automation finishes the job itself — schedules the winner and leaves the loser exactly as it
+ * is (a never-scheduled Draft, which is already 100% safe — nobody is ever emailed it; no code
+ * change needed to guarantee that). Each write goes through klaviyoClient's dry-run/
+ * automation-enabled guard; nothing below reaches Klaviyo unless both AUTOMATION_ENABLED=true and
+ * DRY_RUN=false.
+ *
+ * Two real bugs, both found via the 2026-09-07 controlled test, fixed here:
+ * 1. `send_strategy.datetime` must be a sibling of `options`, not nested inside it (confirmed
+ *    against the live schema and against real send_strategy values already seen on real
+ *    campaigns) — the nested version silently 400'd.
+ * 2. `archived` is read-only via the API — not in the PATCH schema at all (confirmed against the
+ *    official reference docs) — attempting to set it also silently 400'd. Dropped entirely; see
+ *    above for why that's fine.
+ * Both of those calls failing did NOT stop the code from calling campaign-send-jobs next, or
+ * from reporting SUCCESS — that's the real defect. Fixed: every write here is checked before
+ * moving on, and a failed write stops the family (not just that language) with a report of
+ * exactly which languages, if any, were already actioned before the failure.
+ */
 async function processDualCampaignFamily({ family, campaignGroupTag, execution, decision, statA, statB }) {
   const languageResults = [];
   for (const [lang, slot] of family.languages) {
@@ -295,29 +312,56 @@ async function processDualCampaignFamily({ family, campaignGroupTag, execution, 
   }
 
   const targetDate = computeTargetSendDate();
+  const completedLangs = [];
   for (const { lang, slot } of languageResults) {
     const winnerCampaign = decision.winner === "A" ? slot.a : slot.b;
-    const loserCampaign = decision.winner === "A" ? slot.b : slot.a;
 
-    await klaviyoPatch(`/campaigns/${winnerCampaign.id}`, {
+    const scheduleRes = await klaviyoPatch(`/campaigns/${winnerCampaign.id}`, {
       data: {
         type: "campaign",
         id: winnerCampaign.id,
         attributes: {
           send_strategy: {
             method: "static",
-            options: { datetime: `${targetDate}T10:00:00`, is_local: true, send_past_recipients_immediately: false },
+            datetime: `${targetDate}T10:00:00`,
+            options: { is_local: true, send_past_recipients_immediately: false },
           },
         },
       },
     });
-    await klaviyoPost("/campaign-send-jobs", {
+    if (!scheduleRes.ok && !scheduleRes.dryRun) {
+      await updateExecution(execution.id, {
+        status: "FAILED",
+        failure_reason: `scheduling ${lang} campaign ${winnerCampaign.id} failed: ${JSON.stringify(scheduleRes.body)}. Already completed before this: ${completedLangs.join(", ") || "none"}.`,
+      });
+      await notifyFailure({
+        campaignName: campaignGroupTag,
+        winner: decision.winner,
+        problem: `Failed to schedule ${lang} campaign — stopped before sending anything for it`,
+        reason: `Already completed: ${completedLangs.join(", ") || "none"}. Remaining languages were never attempted.`,
+      });
+      return;
+    }
+
+    const sendRes = await klaviyoPost("/campaign-send-jobs", {
       data: { type: "campaign-send-job", id: winnerCampaign.id },
     });
-    await klaviyoPatch(`/campaigns/${loserCampaign.id}`, {
-      data: { type: "campaign", id: loserCampaign.id, attributes: { archived: true } },
-    });
-    console.log(`[${campaignGroupTag}] ${lang}: scheduled variant ${decision.winner} (${winnerCampaign.id}), archived the other (${loserCampaign.id})`);
+    if (!sendRes.ok && !sendRes.dryRun) {
+      await updateExecution(execution.id, {
+        status: "FAILED",
+        failure_reason: `send-job for ${lang} campaign ${winnerCampaign.id} failed after it was already scheduled: ${JSON.stringify(sendRes.body)}. Already fully completed before this: ${completedLangs.join(", ") || "none"}.`,
+      });
+      await notifyFailure({
+        campaignName: campaignGroupTag,
+        winner: decision.winner,
+        problem: `${lang} campaign was scheduled but the send-job failed — it will NOT send on its own, needs manual attention`,
+        reason: `Already completed: ${completedLangs.join(", ") || "none"}.`,
+      });
+      return;
+    }
+
+    completedLangs.push(lang);
+    console.log(`[${campaignGroupTag}] ${lang}: scheduled + sent variant ${decision.winner} (${winnerCampaign.id})`);
   }
 
   await updateExecution(execution.id, { status: "SUCCESS" });
