@@ -300,6 +300,15 @@ campaign looks like this, kept for read-only reporting only, since it's structur
 ever reaching the write path). The two never mix within one family without being flagged as a
 conflict.
 
+**Naming convention amended (2026-09-11): switched from parens to brackets.** Klaviyo-side issue
+with `"(...)"` in new campaign names (not a preference) means every campaign built from this date
+forward uses `"<subject> [xx]"` / `"<subject> [xx][a]"` / `"[xx][b]"` instead of the parenthesized
+forms above. `src/family.mjs`'s `LANGUAGE_SUFFIX`/`VARIANT_SUFFIX` regexes now accept both styles,
+so already-sent real campaigns (all paren-style) keep resolving for read-only reporting — but no
+new campaign should be built with parens going forward. A single suffix mixing styles (e.g.
+`"(fr)[a]"`) is deliberately not recognized as either shape, matching nothing rather than
+guessing.
+
 **Consequence for the API key**: this write path needs `campaigns:write` — `PATCH
 /api/campaigns/{id}` (set schedule) and `{id}`/`archived` (archive the loser), plus
 `POST /api/campaign-send-jobs` (send). The key created for Phase 1 discovery was deliberately

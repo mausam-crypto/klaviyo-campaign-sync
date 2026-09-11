@@ -3,7 +3,8 @@
 Automates what happens after Cellexia's EN Klaviyo campaign's native A/B test concludes: computes
 an independent winner (Placed Order Rate is the primary metric, Click Rate only breaks an exact
 tie), validates the 28 language campaigns (two single-message campaigns per language, `"<subject>
-(xx) (a)"` / `"(b)"`), then schedules the winner and archives the loser itself. An earlier design
+[xx][a]"` / `"[b]"` — bracket suffix since 2026-09-11, see docs/DESIGN.md §3 for why), then
+schedules the winner and archives the loser itself. An earlier design
 (14 campaigns, both variations in one) had no supported way to finish that step automatically and
 stopped at a Slack handoff instead — kept in the codebase for read-only reporting on old-style
 campaigns, see docs/DESIGN.md §7 for the full history.

@@ -6,8 +6,9 @@
 //    below. Read-only reporting only; there's no supported Klaviyo API to remove one message
 //    from this shape (DESIGN.md §7), so it never reaches the write path.
 //  - `dual_campaign` (decided 2026-09-05): two single-message campaigns per language, named
-//    "<subject> (xx) (a)" / "<subject> (xx) (b)". `validateDualCampaignLanguage()` below — the
-//    only structure the write path (src/run.mjs) acts on.
+//    "<subject> (xx) (a)" / "(b)" originally, "<subject> [xx][a]" / "[b]" from 2026-09-11
+//    onward (see src/family.mjs) — `validateDualCampaignLanguage()` below is naming-agnostic,
+//    the only structure the write path (src/run.mjs) acts on.
 //
 // Checks 12/13 (idempotency: "no prior execution for this family+language") and 14 (content-hash
 // drift since discovery) need the Postgres state store, which isn't wired up until Phase 4 —

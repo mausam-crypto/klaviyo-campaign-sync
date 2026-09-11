@@ -3,7 +3,9 @@
 //
 // Two structures, two write paths (DESIGN.md §7 has the full back-and-forth history):
 // - `dual_campaign` (current, for new sends): two single-message campaigns per language, named
-//   "<subject> (xx) (a)"/"(b)". The automation schedules the winning campaign for real (verified
+//   "<subject> [xx][a]"/"[b]" (bracket suffix since 2026-09-11 — Klaviyo-side issue with "(...)"
+//   in new campaign names; src/family.mjs still recognizes the older "(xx) (a)"/"(b)" form too,
+//   for already-sent real campaigns only). The automation schedules the winning campaign for real (verified
 //   end-to-end against a real controlled test 2026-09-07, including catching and fixing two real
 //   API schema bugs and a missing write-verification gap). The losing campaign is simply left as
 //   an un-sent Draft — Klaviyo's API has no way to archive a campaign, but an un-sent Draft is

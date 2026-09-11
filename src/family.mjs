@@ -2,19 +2,27 @@
 //
 // Two structures coexist:
 //  - `legacy_single_campaign`: one campaign per language, two messages inside, named
-//    "<subject> (xx)". What every already-sent real campaign in the account looks like. Kept for
-//    read-only reporting only — there is no supported Klaviyo API to remove one message from
-//    this shape (DESIGN.md §7), so it can never reach the write path.
+//    "<subject> (xx)" / "<subject> [xx]". What every already-sent real campaign in the account
+//    looks like (all paren-style, from before the bracket switch below). Kept for read-only
+//    reporting only — there is no supported Klaviyo API to remove one message from this shape
+//    (DESIGN.md §7), so it can never reach the write path.
 //  - `dual_campaign` (decided 2026-09-05, after briefly testing and rejecting the alternative):
-//    two single-message campaigns per language, named "<subject> (xx) (a)" / "<subject> (xx) (b)".
-//    This is what your team builds going forward. The write path (src/run.mjs) only ever acts on
-//    this structure — each campaign has exactly one message, so scheduling/sending it is
-//    completely standard, well-documented Klaviyo behavior with no ambiguity about what gets sent.
+//    two single-message campaigns per language, named "<subject> (xx) (a)" / "(b)" or
+//    "<subject> [xx][a]" / "[b]". This is what your team builds going forward. The write path
+//    (src/run.mjs) only ever acts on this structure — each campaign has exactly one message, so
+//    scheduling/sending it is completely standard, well-documented Klaviyo behavior with no
+//    ambiguity about what gets sent.
+//
+// Bracket suffix added 2026-09-11: your team can no longer use "(...)" in new campaign names
+// (a real Klaviyo-side issue, not a preference) — everything built going forward uses
+// "[xx]"/"[xx][a]"/"[xx][b]" instead. Parens are kept recognized too, purely so every
+// already-sent real campaign (all paren-style) still resolves for read-only reporting — no new
+// campaign should be built with parens from here on.
 //
 // RISK, still true for both: every campaign in this account currently has empty tags (verified
 // 2026-09-03), so both structures are identified by name, not by Klaviyo tags. Documented risks:
 // - Two unrelated campaigns could share a subject line (e.g. a re-run of a seasonal email).
-// - A language suffix could be typed inconsistently ("(en)" vs "(EN)" vs "(en-us)").
+// - A language suffix could be typed inconsistently ("[en]" vs "[EN]" vs "[en-us]").
 // - A subject line retyped slightly differently per language (translation drift) breaks the
 //   "same base name" assumption entirely.
 // Adopting `group:`/`lang:` Klaviyo tags remains the recommended upgrade if this becomes a real
@@ -22,28 +30,33 @@
 
 import { config } from "./config.mjs";
 
-const LANGUAGE_SUFFIX = /\s*\(([a-z]{2})\)\s*$/i;
-// "<subject> (fr) (a)" / "<subject> (fr) (b)" — two-letter lang code, then a/b, both in their own
-// parens, at the very end. Deliberately requires BOTH parts so a plain "<subject> (fr)" (legacy)
-// never matches this and vice versa.
-const VARIANT_SUFFIX = /\s*\(([a-z]{2})\)\s*\(([ab])\)\s*$/i;
+// Accepts "(xx)" (legacy real campaigns, pre-2026-09-11) or "[xx]" (everything from now on).
+const LANGUAGE_SUFFIX = /\s*(?:\(([a-z]{2})\)|\[([a-z]{2})\])\s*$/i;
+// "<subject> (fr) (a)" / "[fr][a]" — two-letter lang code, then a/b, both in matching brackets of
+// the same style, at the very end. Deliberately requires BOTH parts so a plain "<subject> (fr)"/
+// "[fr]" (legacy) never matches this and vice versa. Mixing styles within one suffix
+// ("(fr)[a]") is deliberately NOT matched — a family should be internally consistent.
+const VARIANT_SUFFIX = /\s*(?:\(([a-z]{2})\)\s*\(([ab])\)|\[([a-z]{2})\]\s*\[([ab])\])\s*$/i;
 
-/** Splits "Some subject (fr)" into { baseName: "Some subject", langCode: "fr" }. Returns null if
- *  the name doesn't end in a recognized "(xx)" language suffix (including if it's actually a
- *  "(xx) (a/b)" variant name — VARIANT_SUFFIX's extra "(a|b)" isn't a valid 2-letter lang code,
- *  so this pattern doesn't accidentally match those). */
+/** Splits "Some subject (fr)" / "Some subject [fr]" into { baseName, langCode }. Returns null if
+ *  the name doesn't end in a recognized language suffix (including if it's actually a two-part
+ *  variant name — VARIANT_SUFFIX's extra "(a|b)" isn't a valid 2-letter lang code, so this
+ *  pattern doesn't accidentally match those). */
 export function parseCampaignName(name) {
   const match = LANGUAGE_SUFFIX.exec(name || "");
   if (!match) return null;
-  return { baseName: name.slice(0, match.index).trim(), langCode: match[1].toLowerCase() };
+  const langCode = match[1] ?? match[2];
+  return { baseName: name.slice(0, match.index).trim(), langCode: langCode.toLowerCase() };
 }
 
-/** Splits "Some subject (fr) (a)" into { baseName: "Some subject", langCode: "fr", variant: "a" }.
- *  Returns null if the name doesn't end in the two-part "(xx) (a|b)" suffix. */
+/** Splits "Some subject (fr) (a)" / "Some subject [fr][a]" into { baseName, langCode, variant }.
+ *  Returns null if the name doesn't end in a two-part "(xx) (a|b)" / "[xx][a|b]" suffix. */
 export function parseVariantCampaignName(name) {
   const match = VARIANT_SUFFIX.exec(name || "");
   if (!match) return null;
-  return { baseName: name.slice(0, match.index).trim(), langCode: match[1].toLowerCase(), variant: match[2].toLowerCase() };
+  const langCode = match[1] ?? match[3];
+  const variant = match[2] ?? match[4];
+  return { baseName: name.slice(0, match.index).trim(), langCode: langCode.toLowerCase(), variant: variant.toLowerCase() };
 }
 
 /**
